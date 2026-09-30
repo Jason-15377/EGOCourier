@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EGO Courier</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <div class="brand">EGO Courier <span class="sub">日志对齐 · 异常检测</span></div>
+    <nav>
+      <button class="nav-btn active" data-view="export">日志导出</button>
+      <button class="nav-btn" data-view="sessions">会话记录</button>
+      <button class="nav-btn" data-view="import">日志分析</button>
+      <button class="nav-btn" data-view="trace">Trace 查询</button>
+      <button class="nav-btn" data-view="wifi">WiFi</button>
+      <button class="nav-btn" data-view="thresholds">阈值</button>
+    </nav>
+  <div id="health" class="health"></div>
+</header>
+
+<main>
+  <!-- 日志导出（BLE 配网 + SSH/SFTP 一键导出导入） -->
+  <section id="view-export" class="view">
+    <div class="toolbar">
+      <h2>日志导出（设备配网 → 拉取 → 一键导入）</h2>
+      <span id="export-avail" class="msg"></span>
+    </div>
+
+    <div class="card">
+      <h3>① Wi-Fi 配网（BLE）</h3>
+      <p class="hint">扫描蓝牙 → 选择设备 → 填 Wi-Fi 名称/密码（各 ≤32 字节）→ 配置并等待设备加入局域网，成功后自动回填设备 IP。需电脑蓝牙已开启。</p>
+      <div class="row">
+        <select id="ble-devices" class="input grow"><option value="">— 点击下方扫描蓝牙设备 —</option></select>
+        <button id="btn-ble-scan" class="btn">扫描蓝牙设备</button>
+      </div>
+      <div class="row">
+        <input id="ble-ssid" class="input grow" placeholder="Wi-Fi 名称（≤32 字节）">
+        <button id="btn-wifi-search" class="btn" title="扫描电脑可见 WiFi，选择后回填（电脑当前连接的会标注）">🔍 WiFi</button>
+        <input id="ble-pwd" class="input grow" type="password" placeholder="Wi-Fi 密码（开放网络留空）">
+      </div>
+      <div class="row">
+        <select id="wifi-pick" class="input grow"><option value="">— 扫描后此处列出可见 WiFi（含电脑已连接）—</option></select>
+        <button id="btn-ble-apply" class="btn primary">配置 Wi-Fi 并添加设备</button>
+      </div>
+      <span id="ble-msg" class="msg"></span>
+    </div>
+
+    <div class="card">
+      <h3>② SSH/SFTP 一键导出</h3>
+      <p class="hint">用配网回填/手填的设备 IP + SSH 账号，拉取设备上的 app 日志与固件日志，拉完自动导入分析。</p>
+      <div class="row">
+        <input id="exp-ip" class="input grow" placeholder="设备 IP（配网成功后自动回填）">
+        <input id="exp-user" class="input grow" placeholder="ssh 用户名">
+        <input id="exp-pwd" class="input grow" type="password" placeholder="ssh 密码">
+      </div>
+      <div class="row">
+        <input id="exp-dirs" class="input grow" value="/ego/logs" placeholder="远端日志目录（& 分隔）">
+        <input id="exp-local" class="input grow" placeholder="本地保存目录（留空用默认 data/exports）">
+      </div>
+      <div class="row">
+        <label><input type="checkbox" id="exp-zip" checked> 先压缩再导出</label>
+        <label><input type="checkbox" id="exp-import" checked> 拉取后自动导入分析</label>
+      </div>
+      <div class="row">
+        <button id="btn-exp" class="btn primary">开始导出并导入</button>
+        <button id="btn-probe" class="btn" title="导出前检查设备是否与电脑在同一网段且 ping 得通">连通性预检</button>
+      </div>
+      <span id="exp-msg" class="msg"></span>
+      <span id="probe-msg" class="msg"></span>
+      <pre id="exp-result" class="result"></pre>
+    </div>
+  </section>
+
+  <!-- 会话列表 -->
+  <section id="view-sessions" class="view hidden">
+    <div class="toolbar">
+      <h2>会话列表</h2>
+      <button id="btn-sel-all" class="btn">全选</button>
+      <button id="btn-sel-none" class="btn">清空</button>
+      <button id="btn-compare" class="btn primary">对比选中</button>
+      <button id="btn-summary" class="btn">导出汇总报告</button>
+      <button id="btn-refresh" class="btn">刷新</button>
+    </div>
+    <table class="tbl" id="sessions-tbl">
+      <thead><tr><th style="width:32px"><input type="checkbox" id="chk-all"></th><th>ID</th><th>设备</th><th>名称</th><th>帧</th><th>异常</th>
+        <th>trace_id</th><th>开始时间</th><th></th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <div id="compare-area" class="hidden" style="margin-top:18px">
+      <h3 style="margin:6px 0">多会话对比</h3>
+      <div id="compare-body"></div>
+    </div>
+  </section>
+
+  <!-- 导入 -->
+  <section id="view-import" class="view hidden">
+    <h2>日志分析</h2>
+    <p class="hint">选择本机会话目录或 zip 日志包，系统自动解析 SEI / MP4-pts / IMU / EGOViewer 日志并做时间戳对齐与异常检测。点「选择目录」会弹出系统文件夹/文件选择框，不用手输路径。</p>
+    <div class="row">
+      <button id="btn-pick-dir" class="btn primary">选择目录…</button>
+      <button id="btn-pick-zip" class="btn">选择 zip…</button>
+      <input id="import-path" class="input grow" placeholder="或直接粘贴本地路径（目录 / zip）">
+      <button id="btn-import" class="btn">导入并分析</button>
+    </div>
+    <pre id="import-result" class="result"></pre>
+  </section>
+
+  <!-- Trace 查询 -->
+  <section id="view-trace" class="view hidden">
+    <h2>Trace 查询</h2>
+    <div class="row">
+      <input id="trace-input" class="input grow" placeholder="输入 32 位 hex trace_id">
+      <button id="btn-trace" class="btn primary">查询</button>
+    </div>
+    <div id="trace-result"></div>
+  </section>
+
+  <!-- WiFi 扫描 -->
+  <section id="view-wifi" class="view hidden">
+    <div class="toolbar">
+      <h2>WiFi 扫描（设备连接通道基础）</h2>
+      <button id="btn-wifi-refresh" class="btn">重新扫描</button>
+    </div>
+    <div id="wifi-status" class="kpis"></div>
+    <table class="tbl" id="wifi-tbl">
+      <thead><tr><th>SSID</th><th>信号</th><th>安全类型</th><th>状态</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <!-- 阈值 -->
+  <section id="view-thresholds" class="view hidden">
+    <h2>异常阈值</h2>
+    <p class="hint">单位微秒(μs)。超过阈值即标记异常，可随时调整后重新解析。</p>
+    <div id="thr-editor"></div>
+    <button id="btn-thr-save" class="btn primary">保存阈值</button>
+    <span id="thr-msg" class="msg"></span>
+  </section>
+
+  <!-- 会话详情（覆盖层） -->
+  <div id="detail-mask" class="mask hidden">
+    <div class="detail">
+      <div class="detail-head">
+        <h2 id="detail-title"></h2>
+        <div class="spacer"></div>
+        <button id="btn-detail-attach" class="btn">关联 app 日志</button>
+        <button id="btn-detail-export" class="btn">导出 zip</button>
+        <button id="btn-detail-close" class="btn">关闭</button>
+      </div>
+      <div id="detail-stats" class="kpis"></div>
+      <div class="tabs">
+        <button class="tab active" data-tab="frames">帧对齐表</button>
+        <button class="tab" data-tab="anomalies">异常列表</button>
+        <button class="tab" data-tab="files">来源文件</button>
+      </div>
+      <div class="filters" id="frames-filters">
+        <select id="f-side"><option value="">全部侧</option><option>left</option><option>right</option></select>
+        <label><input type="checkbox" id="f-anomaly"> 仅异常帧</label>
+      </div>
+      <div id="detail-body"></div>
+    </div>
+  </div>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
