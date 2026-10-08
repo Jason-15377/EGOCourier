@@ -1,0 +1,27 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# ---- 运行时数据（大文件，不入库） ----
+data/
+log/
+
+# ---- 工具 / IDE / 本会话 ----
+.vscode/
+.idea/
+.zcode/
+
+# ---- 临时 / 打包产物 ----
+*.rar
+*.zip
+*.tmp
+temp/
+build/
+dist/
+dist_onefile/
+*.tar.gz
+*.manifest
