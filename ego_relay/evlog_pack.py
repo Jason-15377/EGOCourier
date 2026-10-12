@@ -143,26 +143,59 @@ def _gather(root: str, cat: dict) -> list:
     return found
 
 
-def _file_stamp(abs_path: str, rel: str) -> float:
-    """从文件名/目录名解析日志时间戳（epoch 秒），无法解析时退回文件修改时间。
+def _name_stamp(rel: str):
+    """尝试从文件名/目录名解析日志时间戳（epoch 秒），失败返回 None。
 
     命名规则：EGOViewer_YYYYMMDDHHMMSS.log、OrbbecSDK.YYYYMMDDHHMMSS.log.txt、
     固件时间戳目录 20260927-104153 等。
     """
-    import re
     m = re.search(r"(\d{8})[-_]?(\d{6})", rel)
     if m:
         try:
             return datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S").timestamp()
         except ValueError:
-            pass
-    return os.path.getmtime(abs_path)
+            return None
+    return None
+
+
+def _file_stamp(abs_path: str, rel: str) -> tuple:
+    """返回 (start_stamp, end_stamp, from_name)：该日志文件"内容覆盖"的时间区间。
+
+    文件名/目录名中的时间戳是**日志会话开始**的时刻，而 EGOViewer/OrbbecSDK 的会话
+    可长时间运行、跨天追加写入，故文件名时间只代表区间起点；文件修改时间(mtime)则是
+    最后一次写入的时刻，可作为区间终点。只有两者的区间与筛选窗口有交集才应保留该文件。
+
+    - 有文件名时间戳：start=文件名时间，end=max(文件名时间, mtime)。
+      （正常关闭的会话 mtime 略晚于 start；仍在写入的长会话 mtime 会远晚于 start。）
+    - 无文件名时间戳：只有一个可靠时点，start=end=mtime，from_name=False，
+      界面据此提示"时间取自修改时间，可能与日志真实时间不一致"。
+    """
+    mtime = os.path.getmtime(abs_path)
+    name_stamp = _name_stamp(rel)
+    if name_stamp is not None:
+        return name_stamp, max(name_stamp, mtime), True
+    return mtime, mtime, False
+
+
+def _overlaps(start_stamp: float, end_stamp: float, start, end) -> bool:
+    """判断文件区间 [start_stamp, end_stamp] 是否与筛选窗口 [start, end] 有交集。
+
+    窗口端点可为 None（表示该侧不限）。跨天会话的起点早于窗口起点、但其 mtime 落在
+    窗口内时，仍会被判定为命中——这正是修复"长会话被整份丢弃"的关键。
+    """
+    if start is not None and end_stamp < start:
+        return False
+    if end is not None and start_stamp > end:
+        return False
+    return True
 
 
 def discover(root: str, keys=None) -> dict:
-    """返回某安装根目录下各分类发现的所有日志文件（含 stamp），每类按时间倒序。
+    """返回某安装根目录下各分类发现的所有日志文件（含时间区间），每类按时间倒序。
 
-    供“手动勾选文件”对话框展示用；stamp 用于在界面上显示各文件的日志时间。
+    每个文件带 start_stamp/end_stamp（内容覆盖区间）、stamp（用于列表展示的时点，
+    取会话开始时间；无文件名时间戳时取 mtime）与 from_name。供"手动勾选文件"对话框
+    展示用；stamp 用于在界面上显示各文件的日志时间。
     """
     keys = keys or [c["key"] for c in CATEGORIES]
     result = {}
@@ -173,20 +206,38 @@ def discover(root: str, keys=None) -> dict:
             continue
         files = _gather(root, cat)
         for f in files:
-            f["stamp"] = _file_stamp(f["abs"], f["rel"])
-        files.sort(key=lambda f: f["stamp"], reverse=True)
+            f["start_stamp"], f["end_stamp"], f["from_name"] = _file_stamp(f["abs"], f["rel"])
+            f["stamp"] = f["start_stamp"]
+        files.sort(key=lambda f: f["start_stamp"], reverse=True)
         result[key] = files
     return result
 
 
-def _within(stamp: float, max_age_days, start, end) -> bool:
-    if max_age_days and stamp < time.time() - float(max_age_days) * 86400:
+def _within(start_stamp: float, end_stamp: float, max_age_days, start, end) -> bool:
+    """按文件时间区间 [start_stamp, end_stamp] 判定是否保留（见 _overlaps）。"""
+    if max_age_days and end_stamp < time.time() - float(max_age_days) * 86400:
         return False
-    if start is not None and stamp < start:
-        return False
-    if end is not None and stamp > end:
-        return False
-    return True
+    return _overlaps(start_stamp, end_stamp, start, end)
+
+
+def filter_firmware_pull(fw_paths: list, pulled_at: float,
+                         start=None, end=None) -> tuple:
+    """按「拉取时间戳」筛选刚拉取的固件日志文件。
+
+    设备实时拉取的固件日志文件名由设备给出（如 orbbec_xxx.log），通常不含时间戳，
+    因此不能靠文件名判定时间。这类日志的"日志时间"以本次拉取动作的时刻 pulled_at
+    为准，写入按拉取时间戳命名的子目录（YYYYMMDD-HHMMSS/）后即可与 app/sdk 一样
+    用同一套 [start, end] 判定。pulled_at 落在窗口内则整批保留，否则整批剔除。
+
+    容差：拉取时刻与界面上的"止"（end）往往只差几毫秒到一两秒（终点跟随当前时刻），
+    若严格比较会把刚好落在终点附近的整批固件日志误剔除，故对 end 放宽 2 秒。
+
+    返回 (kept_paths, stamp, within)：stamp 为本次拉取时间戳，within 表示是否命中窗口。
+    """
+    tol = 2.0
+    if _within(pulled_at, pulled_at, None, start, None if end is None else end + tol):
+        return list(fw_paths), pulled_at, True
+    return [], pulled_at, False
 
 
 def collect(root: str, keys=None, max_age_days=None, max_count=None,
@@ -198,7 +249,7 @@ def collect(root: str, keys=None, max_age_days=None, max_count=None,
       start/end     epoch 秒，只保留 [start, end] 时间段内
       manual        {分类key: [绝对路径,...]}，显式指定要打包的文件（此时忽略其它筛选）
 
-    返回 {分类key: [{"abs": 绝对路径, "rel": 相对路径}, ...]}，每类按 rel 排序。
+    返回 {分类key: [{"abs": 绝对路径, "rel": 相对路径, "from_name": 时间是否取自文件名}, ...]}，每类按 rel 排序。
     """
     keys = keys or [c["key"] for c in CATEGORIES]
     if manual is not None:
@@ -206,18 +257,22 @@ def collect(root: str, keys=None, max_age_days=None, max_count=None,
         for key in keys:
             files = []
             for abs_path in (manual.get(key) or []):
-                files.append({"abs": abs_path, "rel": os.path.relpath(abs_path, root)})
+                rel = os.path.relpath(abs_path, root)
+                _start, _end, from_name = _file_stamp(abs_path, rel)
+                files.append({"abs": abs_path, "rel": rel, "from_name": from_name})
             files.sort(key=lambda f: f["rel"])
             result[key] = files
         return result
     disc = discover(root, keys)
     result = {}
     for key in keys:
-        files = [f for f in disc.get(key, []) if _within(f["stamp"], max_age_days, start, end)]
+        files = [f for f in disc.get(key, [])
+                 if _within(f["start_stamp"], f["end_stamp"], max_age_days, start, end)]
         if max_count:
             files = files[:int(max_count)]
         files.sort(key=lambda f: f["rel"])
-        result[key] = [{"abs": f["abs"], "rel": f["rel"]} for f in files]
+        result[key] = [{"abs": f["abs"], "rel": f["rel"], "from_name": f.get("from_name", True)}
+                       for f in files]
     return result
 
 
@@ -251,16 +306,41 @@ def stage(root: str, dest_dir: str, keys=None, max_age_days=None, max_count=None
     return dest_dir, collected
 
 
-def _manifest_lines(root: str, collected: dict, max_age_days) -> tuple:
+def _manifest_lines(root: str, collected: dict, max_age_days, start=None, end=None) -> tuple:
     manifest = {
         "export_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "ego_viewer_root": root,
         "recent_days": int(max_age_days) if max_age_days else None,
+        "time_range": None,
+        "mtime_based_files": [],
         "categories": [],
     }
     lines = ["EGOViewer 日志打包说明", "=" * 30, ""]
+    if start is not None or end is not None:
+        def _fmt(v):
+            return datetime.fromtimestamp(v).strftime("%Y-%m-%d %H:%M:%S") if v is not None else "不限"
+        rng = f"{_fmt(start)} ～ {_fmt(end)}"
+        manifest["time_range"] = {"start": start, "end": end, "text": rng}
+        lines.append(f"筛选：包含日志会话时间与 {rng} 有交集的日志文件")
+        lines.append("说明：日志文件名中的时间戳是「会话开始时刻」，而 EGOViewer/OrbbecSDK 的")
+        lines.append("      会话可持续运行并跨天追加写入。因此「开始于窗口之前、但仍在窗口内")
+        lines.append("      写入」的长会话也会被包含（其内容覆盖了所选时间段）。")
+        lines.append("")
     if max_age_days:
         lines.append(f"筛选：仅包含最近 {int(max_age_days)} 天内修改的日志")
+        lines.append("")
+    # 时间戳来自文件修改时间（文件名无法解析出时间）的文件：时间可能不准，单独列出提醒
+    mtime_files = []
+    for cat in CATEGORIES:
+        for f in collected.get(cat["key"], []):
+            if not f.get("from_name", True):
+                mtime_files.append(f["rel"])
+    if mtime_files:
+        manifest["mtime_based_files"] = mtime_files
+        lines.append(f"注意：以下 {len(mtime_files)} 个文件的文件名不含时间戳，"
+                     "其时间取自文件修改时间，可能与日志真实时间不一致：")
+        for rel in mtime_files:
+            lines.append(f"  - {rel}")
         lines.append("")
     for cat in CATEGORIES:
         key = cat["key"]
@@ -278,7 +358,7 @@ def _manifest_lines(root: str, collected: dict, max_age_days) -> tuple:
 
 def pack_staged(staged_dir: str, out_dir: str, root: str, collected: dict,
                 prefix: str = "EGOViewer_logs", max_age_days=None,
-                progress_cb=None) -> str:
+                start=None, end=None, progress_cb=None) -> str:
     """把已 stage 到 staged_dir 的日志打包成 <out_dir>/<prefix>_<YYYYMMDD_HHMMSS>.zip。
 
     返回 zip 绝对路径。未找到任何日志时抛 FileNotFoundError。
@@ -290,7 +370,7 @@ def pack_staged(staged_dir: str, out_dir: str, root: str, collected: dict,
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     zip_path = os.path.join(out_dir, f"{prefix}_{ts}.zip")
 
-    manifest, lines = _manifest_lines(root, collected, max_age_days)
+    manifest, lines = _manifest_lines(root, collected, max_age_days, start, end)
     written = 0
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for dirpath, _dirnames, filenames in os.walk(staged_dir):

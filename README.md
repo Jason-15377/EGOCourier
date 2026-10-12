@@ -57,14 +57,21 @@ python run_desktop.py
 
 ## 打包成 .exe
 
-把桌面端打成独立多分辨率图标的 Windows 可执行文件，目标机器无需装 Python：
+把桌面端打成独立多分辨率图标的 Windows 可执行文件，目标机器无需装 Python。
+两套配置产出的程序**功能一致**，只是目录结构不同，别混用：
 
 ```bat
+:: 方式一：PyInstaller 默认形态（_internal\ 目录布局）
 build_exe.bat            :: onedir → dist\EGO Courier\EGO Courier.exe（推荐）
 build_exe.bat onefile    :: 单文件 → dist\EGO Courier.exe
+
+:: 方式二：便携版（runtime\ 目录布局，对齐 Ego-Vue Simple Evaluate）
+build_portable.bat       :: → dist\EGO Courier\EGO Courier.exe + runtime\
 ```
 
-详见 [README_桌面端.md](README_桌面端.md#打包成-exe另一版启动方式)。
+便携版把依赖摊在 `runtime\`、源码明文放在 `runtime\app\`，**现场改 `.py` 重启即生效、
+不用重新打包**，适合交给测试同事。见 [README_便携版.md](README_便携版.md)；
+方式一详见 [README_桌面端.md](README_桌面端.md#打包成-exe另一版启动方式)。
 
 ## 命令行工具（ego）
 

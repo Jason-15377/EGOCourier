@@ -62,6 +62,16 @@ QPushButton#scanBtn { padding:0 16px; background:#f3f4f6; color:#374151;
   border:1px solid #d1d5db; border-radius:4px; font-size:13px; }
 QPushButton#scanBtn:hover { background:#e5e7eb; }
 QFrame#devicePopup { background:#ffffff; border:1px solid #94a3b8; border-radius:8px; }
+/* ---- 时间段选择框：与表单控件同一外观，右侧单个下拉箭头 ---- */
+QWidget#dtField { background:#ffffff; border:1px solid #d1d5db; border-radius:4px; }
+QWidget#dtField:hover { border-color:#9ca3af; }
+QLabel#dtFieldText { background:transparent; border:none; padding:0 2px; }
+QToolButton#dtFieldArrow { border:none; background:transparent; color:#6b7280;
+  padding:0 3px; }
+QToolButton#dtFieldArrow:hover { color:#374151; }
+QWidget#dtPopup { background:#ffffff; border:1px solid #cbd5e1; border-radius:8px; }
+QTimeEdit#dtTimeEdit { background:#ffffff; border:1px solid #d1d5db; border-radius:4px;
+  padding:0 6px; }
 QListWidget#devicePopupList { background:#ffffff; border:1px solid #e2e5ea;
   border-radius:6px; outline:0; }
 QListWidget#devicePopupList::item { padding:6px 8px; border-radius:4px; }

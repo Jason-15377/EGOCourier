@@ -15,14 +15,15 @@ import threading
 import time
 from datetime import datetime
 
-from PySide6.QtCore import Qt, QThread, Signal, QSettings, QPoint, QRect, QEvent, QDateTime, QTime
+from PySide6.QtCore import Qt, QThread, Signal, QSettings, QPoint, QRect, QEvent, QDateTime, QTime, QTimer
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QPushButton, QFileDialog,
     QLineEdit, QLabel, QGroupBox,
     QCheckBox, QMessageBox, QProgressBar, QPlainTextEdit,
     QComboBox, QFrame,
     QScrollArea, QListWidget, QListWidgetItem, QToolButton,
-    QDateTimeEdit, QDialog, QDialogButtonBox,
+    QDateTimeEdit, QDialog, QDialogButtonBox, QAbstractSpinBox,
+    QTimeEdit, QCalendarWidget,
     QTreeWidget, QTreeWidgetItem, QAbstractItemView,
 )
 
@@ -202,6 +203,8 @@ class EvLogPackWorker(QThread):
             zip_path = evlog_pack.pack_staged(
                 work, self.out_dir, self.root, collected, prefix=self.prefix,
                 max_age_days=self.stage_kwargs.get("max_age_days"),
+                start=self.stage_kwargs.get("start"),
+                end=self.stage_kwargs.get("end"),
                 progress_cb=lambda pct: self.progress.emit(pct))
             self.status.emit(f"打包完成：{zip_path}")
 
@@ -240,6 +243,7 @@ class EvLogPackWorker(QThread):
 # ---------------------------------------------------------------------------
 # 一键导出后台线程：识别 EGOViewer 根目录 → 全新时间戳目录收集所选分类日志 → 导入分析 + 报告
 #   每次都在输出目录下新建 EGO_export_<时间戳>/，从源目录现拉最新日志，不复用本地旧日志。
+#   app/sdk 按当前筛选方式（时间段 / 手动勾选）筛选后收集。
 #   勾选 firmware 时通过 Orbbec SDK 从设备实时拉取最新固件日志（等价 EGOviewer「导出设备日志」）。
 # ---------------------------------------------------------------------------
 class EgoOneClickExportWorker(QThread):
@@ -248,9 +252,11 @@ class EgoOneClickExportWorker(QThread):
     done = Signal(str, object, str)     # export_dir, session_id(可能 None), report_path(可能 "")
     failed = Signal(str)
 
-    def __init__(self, root, out_dir, keys, auto_import=False, auto_report=False):
+    def __init__(self, root, out_dir, keys, stage_kwargs=None,
+                 auto_import=False, auto_report=False):
         super().__init__()
         self.root, self.out_dir, self.keys = root, out_dir, keys
+        self.stage_kwargs = dict(stage_kwargs or {})
         self.auto_import = auto_import
         self.auto_report = auto_report
 
@@ -262,30 +268,58 @@ class EgoOneClickExportWorker(QThread):
             self.status.emit(f"识别 EGOViewer 根目录：{self.root}")
             os.makedirs(export_dir, exist_ok=True)
             collected = {}
-            # app/sdk：从本机 EGOViewer 根目录收集（进度 0–50）
+            # app/sdk：从本机 EGOViewer 根目录收集（进度 0–50），按当前筛选方式应用时间/手动筛选
             app_sdk = [k for k in self.keys if k != "firmware"]
             if app_sdk:
                 self.status.emit("收集 app/SDK 日志…")
                 _staged, c = evlog_pack.stage(
                     self.root, export_dir, app_sdk,
-                    progress_cb=lambda pct: self.progress.emit(int(pct * 0.5)))
+                    progress_cb=lambda pct: self.progress.emit(int(pct * 0.5)),
+                    **self.stage_kwargs)
                 collected.update(c)
-            # firmware：像 EGOviewer「导出设备日志」一样，通过 Orbbec SDK 从设备实时拉取最新固件日志
+            # firmware：像 EGOviewer「导出设备日志」一样，通过 Orbbec SDK 从设备实时拉取最新固件日志。
+            # 拉取的固件日志文件名由设备给出、通常不含时间戳，故按其「拉取时间戳」放进同名子目录，
+            # 再按当前时间段筛选：拉取时刻不落在窗口内则整批跳过（与 app/sdk 的窗口判定一致）。
             if "firmware" in self.keys:
-                self.status.emit("通过 Orbbec SDK 从设备实时拉取固件日志…（保持设备连接）")
-                fw_dir = os.path.join(export_dir, "firmware")
-                try:
-                    fw_paths = orbbec_sdk.export_firmware_logs(
-                        fw_dir, sdk_root=self.root, device_ip="",
-                        device_port=config.ORBBEC_SDK_PORT,
-                        progress_cb=lambda pct, name: self.progress.emit(50 + int(pct * 0.5)))
-                except orbbec_sdk.OrbbecSdkError as e:
-                    raise RuntimeError(
-                        f"固件日志导出失败，请确认设备已连接、EGOviewer 未占用设备：{e}") from e
-                collected["firmware"] = [
-                    {"abs": p, "rel": os.path.basename(p)} for p in fw_paths]
+                pull_at = time.time()
+                pull_name = datetime.fromtimestamp(pull_at).strftime("%Y%m%d-%H%M%S")
+                _kept, _stamp, within = evlog_pack.filter_firmware_pull(
+                    [], pull_at,
+                    start=self.stage_kwargs.get("start"),
+                    end=self.stage_kwargs.get("end"))
+                if not within:
+                    self.status.emit(
+                        f"本次固件日志拉取时间 {pull_name} 不在所选时间段内，跳过 firmware（如需包含请调整时间段或改用手动勾选）")
+                else:
+                    self.status.emit("通过 Orbbec SDK 从设备实时拉取固件日志…（保持设备连接）")
+                    fw_dir = os.path.join(export_dir, "firmware", pull_name)
+                    try:
+                        fw_paths = orbbec_sdk.export_firmware_logs(
+                            fw_dir, sdk_root=self.root, device_ip="",
+                            device_port=config.ORBBEC_SDK_PORT,
+                            progress_cb=lambda pct, name: self.progress.emit(50 + int(pct * 0.5)))
+                    except orbbec_sdk.OrbbecSdkError as e:
+                        raise RuntimeError(
+                            f"固件日志导出失败，请确认设备已连接、EGOviewer 未占用设备：{e}") from e
+                    fw_paths, _stamp, _within = evlog_pack.filter_firmware_pull(
+                        fw_paths, pull_at,
+                        start=self.stage_kwargs.get("start"),
+                        end=self.stage_kwargs.get("end"))
+                    collected["firmware"] = [
+                        {"abs": p,
+                         "rel": os.path.join(pull_name, os.path.basename(p)),
+                         "from_name": True} for p in fw_paths]
             n = sum(len(v) for v in collected.values())
             if n == 0:
+                # 区分"没有日志"与"被时间段筛掉了"：后者多发生在默认时间段不含旧日志时，
+                # 提示用户放宽时间段，而不是误报为安装目录有问题。
+                s, e = self.stage_kwargs.get("start"), self.stage_kwargs.get("end")
+                if s is not None or e is not None:
+                    def _f(v):
+                        return datetime.fromtimestamp(v).strftime("%Y-%m-%d %H:%M:%S") if v else "不限"
+                    raise RuntimeError(
+                        f"在所选时间段（{_f(s)} ～ {_f(e)}）内未找到任何日志。"
+                        "请把「时间段」放宽（起点可往前调），或改用「手动勾选文件」。")
                 raise RuntimeError("按所选分类未找到任何日志，请检查 EGOViewer 安装目录")
             self.status.emit(f"已导出 {n} 个日志文件到：{export_dir}")
 
@@ -405,16 +439,42 @@ class SearchableDeviceCombo(QWidget):
             self._popup_search.setText("")
         else:
             self._filter_devices(self._popup_search.text() if self._popup_search else "")
-        pos = self.mapToGlobal(QPoint(0, self.height() + 2))
-        width = max(self.width(), 300)
-        n = max(self._popup_list.count(), 1)
-        height = 40 + min(n, 8) * 32
-        self._popup.setGeometry(QRect(pos.x(), pos.y(), width, height))
+        self._resize_popup()
         self._popup.show()
         self._popup.raise_()
         if self._popup_search:
             self._popup_search.setFocus()
             self._popup_search.selectAll()
+
+    def _resize_popup(self):
+        """按当前列表条数重算浮层尺寸，并夹到屏幕可用区域内，避免弹窗显示不全。
+
+        首次打开时列表只有"正在扫描…"一条，扫描结果回来后会重新调用本方法，
+        使弹窗高度随结果条数增长（此前只在打开时算一次，导致结果到达后仍被裁切）。
+        """
+        if not self._popup:
+            return
+        pos = self.mapToGlobal(QPoint(0, self.height() + 2))
+        width = max(self.width(), 300)
+        # 上下内边距 + 搜索框 + 列表（最多 8 行，每行约 32px）
+        n = max(self._popup_list.count(), 1)
+        row_h = 32
+        header_h = 48
+        height = header_h + min(n, 8) * row_h + 12
+        # 夹到控件所在屏幕的可用区域，防止贴底时下半截被截掉
+        screen = self.screen()
+        avail = screen.availableGeometry() if screen else None
+        if avail is not None:
+            if pos.y() + height > avail.bottom():
+                # 下方空间不足：改为向上弹出
+                pos = self.mapToGlobal(QPoint(0, -height - 2))
+                if pos.y() < avail.top():
+                    pos.setY(avail.top())
+                    height = min(height, avail.bottom() - avail.top())
+            width = min(width, avail.width())
+        self._popup.setGeometry(QRect(pos.x(), pos.y(), width, height))
+        if hasattr(self, "_popup_list") and self._popup_list is not None:
+            self._popup_list.updateGeometry()
 
     # ------------------------------------------------------ 数据
     def set_devices(self, devices):
@@ -458,6 +518,9 @@ class SearchableDeviceCombo(QWidget):
             it = QListWidgetItem("未发现匹配设备")
             it.setFlags(Qt.NoItemFlags)
             self._popup_list.addItem(it)
+        # 列表条数变化后重算浮层高度，避免结果到达后仍按旧高度显示被裁切
+        if self._popup and self._popup.isVisible():
+            self._resize_popup()
 
     def _on_pick(self, item):
         dev = item.data(Qt.UserRole)
@@ -466,6 +529,132 @@ class SearchableDeviceCombo(QWidget):
         self.set_selected(dev)
         if self._popup:
             self._popup.close()
+
+
+# ---------------------------------------------------------------------------
+# 日期+时间选择器：弹出浮层同时选日期（日历）与时/分/秒（滚轮），
+#   避免 QDateTimeEdit 默认日历弹层只能点日期、时间还要手动输入的问题。
+# ---------------------------------------------------------------------------
+class DateTimePopup(QWidget):
+    """日历 + 时分秒滚轮的组合弹层，选中后回填到 QDateTimeEdit。"""
+
+    committed = Signal()   # 点「确定」确认选择
+
+    def __init__(self, target: "DateTimeField", parent=None):
+        super().__init__(parent, Qt.Popup)
+        self._target = target
+        self.setObjectName("dtPopup")
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(8)
+
+        self.cal = QCalendarWidget()
+        self.cal.setGridVisible(True)
+        self.cal.setVerticalHeaderFormat(QCalendarWidget.NoVerticalHeader)
+        cur = target.dateTime()
+        self.cal.setSelectedDate(cur.date())
+        lay.addWidget(self.cal)
+
+        # 时间行：三段数字输入（时/分/秒），去掉步进箭头，用与表单一致的控件样式
+        trow = QHBoxLayout()
+        trow.setSpacing(6)
+        tlab = QLabel("时间")
+        tlab.setStyleSheet("color:#6b7280;")
+        trow.addWidget(tlab)
+        self.tm = QTimeEdit(cur.time())
+        self.tm.setObjectName("dtTimeEdit")
+        self.tm.setDisplayFormat("HH:mm:ss")
+        self.tm.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        self.tm.setAlignment(Qt.AlignCenter)
+        self.tm.setFixedHeight(30)
+        self.tm.setMinimumWidth(110)
+        trow.addWidget(self.tm)
+        trow.addStretch(1)
+        lay.addLayout(trow)
+
+        btns = QHBoxLayout()
+        btns.setSpacing(8)
+        btn_now = QPushButton("此刻")
+        btn_now.clicked.connect(self._pick_now)
+        btn_ok = QPushButton("确定")
+        btn_ok.setProperty("role", "primary")
+        btn_ok.clicked.connect(self._commit)
+        btns.addWidget(btn_now)
+        btns.addStretch(1)
+        btns.addWidget(btn_ok)
+        lay.addLayout(btns)
+
+        self.cal.clicked.connect(lambda _d: self.tm.setFocus())
+
+    def _pick_now(self):
+        n = QDateTime.currentDateTime()
+        self.cal.setSelectedDate(n.date())
+        self.tm.setTime(n.time())
+
+    def _commit(self):
+        self._target.setDateTime(QDateTime(self.cal.selectedDate(), self.tm.time()))
+        self.committed.emit()
+        self.close()
+
+
+class ClickableDateTimeEdit(QWidget):
+    """日期时间选择框：外观与表单控件一致（白底/浅灰边/圆角 + 单个下拉箭头），
+    点击任意处弹出「日历 + 时间」组合浮层，不再使用 QDateTimeEdit 自带的步进箭头。"""
+
+    userPicked = Signal()    # 用户在浮层点「确定」确认了时间（视为手动指定）
+    dateTimeChanged = Signal()   # 值变化（供外部刷新计数等），替代原 QDateTimeEdit 的信号
+
+    def __init__(self, dt: QDateTime, parent=None):
+        super().__init__(parent)
+        self._dt = QDateTime(dt)
+        self._popup = None
+        self.setObjectName("dtField")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setFixedHeight(30)
+        self.setMinimumWidth(180)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip("点击选择日期和时间（时/分/秒）")
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(8, 0, 2, 0)
+        lay.setSpacing(0)
+        self._display = QLabel()
+        self._display.setObjectName("dtFieldText")
+        self._display.setStyleSheet("color:#222;")
+        self._arrow = QToolButton()
+        self._arrow.setObjectName("dtFieldArrow")
+        self._arrow.setText("▾")
+        self._arrow.setFixedWidth(22)
+        self._arrow.setCursor(Qt.PointingHandCursor)
+        self._arrow.setFocusPolicy(Qt.NoFocus)
+        self._arrow.clicked.connect(self._open_popup)
+        lay.addWidget(self._display, 1)
+        lay.addWidget(self._arrow)
+        self._refresh()
+
+    # ---- 值接口：尽量兼容原 QDateTimeEdit 调用点 ----
+    def dateTime(self) -> QDateTime:
+        return QDateTime(self._dt)
+
+    def setDateTime(self, dt: QDateTime):
+        self._dt = QDateTime(dt)
+        self._refresh()
+        self.dateTimeChanged.emit()
+
+    def setDisplayFormat(self, _fmt):
+        self._refresh()   # 统一固定为 yyyy-MM-dd HH:mm:ss，忽略外部格式
+
+    def _refresh(self):
+        self._display.setText(self._dt.toString("yyyy-MM-dd HH:mm:ss"))
+
+    def mousePressEvent(self, ev):  # noqa: N802 (Qt 命名)
+        self._open_popup()
+
+    def _open_popup(self):
+        self._popup = DateTimePopup(self, self)
+        self._popup.committed.connect(self.userPicked.emit)
+        pos = self.mapToGlobal(QPoint(0, self.height() + 2))
+        self._popup.move(pos)
+        self._popup.show()
 
 
 # ---------------------------------------------------------------------------
@@ -670,20 +859,29 @@ class DeviceTab(QWidget):
         self.cmb_filter.addItem("时间段", "range")
         self.cmb_filter.addItem("手动勾选文件", "manual")
         self.cmb_filter.currentIndexChanged.connect(self._on_filter_mode)
-        # 时间段范围：用「～」分隔起止，默认当天
+        # 时间段范围：用「～」分隔起止。默认「今天 00:00 ～ 现在」，与用户预期一致；
+        # 若今天没有日志，一键导出会给出明确提示（而不是静默导出旧日志或误报目录有问题）。
         now = QDateTime.currentDateTime()
         today_start = QDateTime(now.date(), QTime(0, 0))
-        self.edit_range_start = QDateTimeEdit(today_start)
+        self.edit_range_start = ClickableDateTimeEdit(today_start)
         self.lbl_range_sep = QLabel("～")
-        self.edit_range_end = QDateTimeEdit(now)
+        self.lbl_range_sep.setStyleSheet("color:#6b7280;")
+        self.edit_range_end = ClickableDateTimeEdit(now)
         for e in (self.edit_range_start, self.edit_range_end):
             e.setFixedHeight(CTRL_H)
-            e.setDisplayFormat("yyyy-MM-dd HH:mm")
-            e.setCalendarPopup(True)
-            e.setMinimumWidth(150)
+            e.setMinimumWidth(180)
         self.lbl_range_sep.setFixedHeight(CTRL_H)
         self.edit_range_start.dateTimeChanged.connect(self._update_pack_counts)
         self.edit_range_end.dateTimeChanged.connect(self._update_pack_counts)
+        # 「止」时间默认跟随当前时刻：用户未手动改过时，随界面刷新自动推进到最新时间，
+        # 避免启动那一刻就定格、导出时窗口偏旧。
+        self._end_is_auto = True
+        self.edit_range_end.userPicked.connect(self._on_end_picked)
+        self.edit_range_end.dateTimeChanged.connect(self._on_end_edited)
+        self._range_timer = QTimer(self)
+        self._range_timer.setInterval(1000)
+        self._range_timer.timeout.connect(self._tick_end_now)
+        self._range_timer.start()
         # 手动模式控件
         self.btn_select_files = QPushButton("选择日志文件…")
         # 全局 QSS 给按钮 9px 垂直内边距，若再锁死 30px 高度会把文字裁掉、点击区被压扁，
@@ -985,6 +1183,10 @@ class DeviceTab(QWidget):
         if not keys:
             QMessageBox.warning(self, "提示", "请至少勾选一种日志")
             return
+        filters = self._current_filters()
+        if self.cmb_filter.currentData() == "manual" and not (self._manual_selection or {}):
+            QMessageBox.warning(self, "提示", "请先点击「选择日志文件…」勾选要导出的日志")
+            return
         out_dir = self.edit_local.text().strip() or str(relay_config.EXPORT_DIR)
         try:
             os.makedirs(out_dir, exist_ok=True)
@@ -999,6 +1201,7 @@ class DeviceTab(QWidget):
         self.log(f"开始一键导出：{root} → {out_dir}（勾选 {'/'.join(keys)}）")
         self._export_worker = EgoOneClickExportWorker(
             root, out_dir, keys,
+            stage_kwargs=filters,
             auto_import=self.chk_import.isChecked(),
             auto_report=self.chk_report.isChecked())
         self._export_worker.progress.connect(self.progress.setValue)
@@ -1030,6 +1233,33 @@ class DeviceTab(QWidget):
     def _on_export_fail(self, err):
         self._append(f"[错误] 一键导出失败: {err}")
         self.log(f"一键导出失败: {err}")
+        # 若因时间段内无日志而失败：主动询问是否放宽到"全部日志"再试，避免卡在死路上。
+        if "内未找到任何日志" in str(err):
+            ret = QMessageBox.question(
+                self, "时间段内没有日志",
+                "当前时间段内没有找到日志。\n\n是否放宽时间范围（起点设为全部日志的最早时间）后重试？",
+                QMessageBox.Yes | QMessageBox.No)
+            if ret == QMessageBox.Yes:
+                self._widen_range_to_all()
+                self._start_export()
+
+    def _widen_range_to_all(self):
+        """把时间段起点放宽到本机最早日志时间（终点保持当前/用户设定），便于一键重试。"""
+        root = self._current_ev_root()
+        if not root or not os.path.isdir(root):
+            return
+        try:
+            disc = evlog_pack.discover(root)
+        except Exception:  # noqa: BLE001
+            return
+        stamps = [f["stamp"] for files in disc.values() for f in files]
+        if not stamps:
+            return
+        self._end_is_auto = False
+        self.edit_range_start.setDateTime(
+            QDateTime.fromSecsSinceEpoch(int(min(stamps)) - 1))
+        self.edit_range_end.setDateTime(QDateTime.currentDateTime())
+        self._update_pack_counts()
 
     def _on_export_finished(self):
         self.btn_export.setEnabled(True)
@@ -1067,6 +1297,31 @@ class DeviceTab(QWidget):
     def _current_ev_root(self):
         return self.cmb_ev_root.currentData() or self.cmb_ev_root.currentText()
 
+    def _on_end_edited(self):
+        """「止」时间被改动后，停止自动跟随当前时刻。
+
+        自动跟随的写入会先置 _end_auto_writing，从而区分“用户改动”与“程序推进”。
+        """
+        if getattr(self, "_end_auto_writing", False):
+            return
+        self._end_is_auto = False
+
+    def _on_end_picked(self):
+        """用户在弹层里确认了「止」时间，视为手动指定，停止自动跟随。"""
+        self._end_is_auto = False
+
+    def _tick_end_now(self):
+        """未手动改过「止」时，每秒把它推进到当前时刻，保证默认窗口是最新的。"""
+        if not getattr(self, "_end_is_auto", False):
+            return
+        mode = self.cmb_filter.currentData() if hasattr(self, "cmb_filter") else None
+        if mode != "range":
+            return
+        self._end_auto_writing = True
+        self.edit_range_end.setDateTime(QDateTime.currentDateTime())
+        self._end_auto_writing = False
+        self._update_pack_counts()
+
     def _current_filters(self):
         """按当前筛选方式返回传给 evlog_pack.stage/collect 的关键字参数。"""
         mode = self.cmb_filter.currentData()
@@ -1080,26 +1335,55 @@ class DeviceTab(QWidget):
         return {}
 
     def _update_pack_counts(self):
-        """刷新各分类勾选框旁的日志计数。"""
+        """刷新各分类勾选框旁的日志计数，使其与实际导出内容一致。
+
+        app/sdk：来自本机 EGOViewer 根目录，按当前筛选方式（时间段/手动勾选）过滤，
+                 计数即"一键导出实际会收集的文件数"。
+        firmware：导出时不收集本机文件，而是导出那一刻通过 Orbbec SDK 从设备实时拉取；
+                 因此不能显示本机磁盘上的固件日志数（会与实际导出对不上），改为提示
+                 "实时拉取"，并给出当前时间段是否会命中的判定。
+        """
         root = self._current_ev_root()
         filters = self._current_filters()
         counts = {}
         if root and os.path.isdir(root):
             try:
-                c = evlog_pack.collect(root, **filters)
+                # 仅统计 app/sdk（本机收集）；firmware 不参与本机计数
+                c = evlog_pack.collect(root, ["app", "sdk"], **filters)
                 counts = {k: len(v) for k, v in c.items()}
             except Exception:  # noqa: BLE001
                 counts = {}
+        manual_mode = self.cmb_filter.currentData() == "manual"
         for key, lbl in self._pack_counts.items():
-            n = counts.get(key, 0)
-            txt = f"[{n} 个]" if n else "[未找到]"
+            if key == "firmware":
+                txt = self._firmware_count_text(filters)
+            else:
+                n = counts.get(key, 0)
+                txt = f"[{n} 个]" if n else "[未找到]"
             lbl.setText(txt)
-            lbl.setStyleSheet("color:#2563eb;" if n else "color:#9ca3af;")
+            lbl.setStyleSheet("color:#2563eb;" if "未找到" not in txt and "不命中" not in txt
+                              else "#9ca3af;")
             # 同步更新 hover Tooltip 里的文件数量
             chk = self._pack_checks.get(key)
             if chk is not None:
-                tip = f"来源路径：{self._pack_sources.get(key, '')}\n文件数量：{txt}"
+                src = "（导出时从设备实时拉取）" if key == "firmware" else self._pack_sources.get(key, "")
+                tip = f"来源路径：{src}\n文件数量：{txt}"
                 chk.setToolTip(tip)   # 仅复选框带 Tooltip，数量标签不弹提示
+
+    def _firmware_count_text(self, filters):
+        """固件日志计数文案：说明它是实时拉取，并判断当前时间段是否会命中。
+
+        取本次导出动作时刻（即当前时刻）代入时间段判定，等价于导出时 firmware 分支的
+        `filter_firmware_pull([], now, start, end)` 结果，保证"显示"与"导出"口径一致。
+        手动勾选模式下仍需有时间窗口；无窗口时（理论上不会）按命中处理。
+        """
+        start, end = filters.get("start"), filters.get("end")
+        if self.cmb_filter.currentData() != "range":
+            # 手动模式不适用于固件（固件不能手动挑文件），仍以"实时拉取"提示
+            return "[实时拉取]"
+        now = time.time()
+        _kept, _stamp, within = evlog_pack.filter_firmware_pull([], now, start=start, end=end)
+        return "[实时拉取·命中]" if within else "[实时拉取·当前不命中]"
 
     def _on_filter_mode(self, _idx):
         if not hasattr(self, "cmb_filter"):
@@ -1152,7 +1436,11 @@ class DeviceTab(QWidget):
             tree.addTopLevelItem(top)
             for f in files:
                 stamp = datetime.fromtimestamp(f["stamp"]).strftime("%Y-%m-%d %H:%M:%S")
-                it = QTreeWidgetItem([os.path.basename(f["abs"]), stamp])
+                name_txt = os.path.basename(f["abs"])
+                if not f.get("from_name", True):
+                    # 文件名不含时间戳，时间取自文件修改时间，标注提醒避免误判
+                    stamp += "（按修改时间）"
+                it = QTreeWidgetItem([name_txt, stamp])
                 it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
                 it.setData(0, Qt.UserRole, (key, f["abs"]))
                 it.setToolTip(0, f["abs"])
