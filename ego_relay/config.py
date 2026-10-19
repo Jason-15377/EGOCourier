@@ -156,8 +156,12 @@ SOURCE_PATTERNS = {
     # EGOViewer 应用日志：ego-viewer-*.log（app 目录，含 sessionId 即 trace）
     #   + EGOViewer 本机导出的 EGOViewer_*.log（data/logs）
     #   + 固件 orbbec.log / orbbec_1.log
+    #   + 设备侧固件日志原文件：messages.log*（BusyBox syslog）、observice.console.log*
+    #     （AOE Service 控制台），含 _YYYYMMDD_HHMMSS.log 轮转后缀
     "viewer_app": ["**/ego-viewer-*.log", "**/EGOViewer_*.log",
-                   "EGOViewer_*.log", "**/orbbec*.log", "orbbec*.log"],
+                   "EGOViewer_*.log", "**/orbbec*.log", "orbbec*.log",
+                   "**/messages.log*", "messages.log*",
+                   "**/observice.console.log*", "observice.console.log*"],
 }
 
 

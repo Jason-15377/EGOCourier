@@ -112,6 +112,19 @@ class TestFileStamp(unittest.TestCase):
             self.assertFalse(from_name)
             self.assertEqual(start, end)
 
+    def test_ego4b_date_named_logs_get_own_dates(self):
+        """EGO-4B 的 orbbec_2026-10-14.log 按日期命名，不能被目录里的拉取时刻覆盖。"""
+        rel_dir = "20261019-142550"
+        self.assertEqual(ep._name_stamp(f"{rel_dir}/orbbec_2026-10-13.log"),
+                         _ts(2026, 10, 13))
+        self.assertEqual(ep._name_stamp(f"{rel_dir}/orbbec_2026-10-14.log.1"),
+                         _ts(2026, 10, 14))
+        self.assertEqual(ep._name_stamp(f"{rel_dir}/dmesg_20261014_152312.txt"),
+                         _ts(2026, 10, 14, 15, 23, 12))
+        # 没有自身时间的文件才退回目录名（拉取时刻）
+        self.assertEqual(ep._name_stamp(f"{rel_dir}/event.log"),
+                         _ts(2026, 10, 19, 14, 25, 50))
+
 
 class TestOverlap(unittest.TestCase):
     def test_overlap_semantics(self):
@@ -176,6 +189,115 @@ class TestStageCrossDay(unittest.TestCase):
                                                         "EGOViewer_20261009175055.log")))
             self.assertTrue(os.path.isfile(os.path.join(out, "sdk",
                                                         "OrbbecSDK.20261009175056.log.txt")))
+
+
+class TestStageExternalFirmware(unittest.TestCase):
+    """设备实时拉取的固件日志：归档到 firmware/<拉取时刻>/，不再多套一层。"""
+
+    def test_arcname_keeps_timestamp_dir(self):
+        # 固件日志的 <拉取时刻>/orbbec.log 必须保留子目录，不能折叠成 firmware/orbbec.log
+        self.assertEqual(ep._arcname("20261016-152734/orbbec.log", "firmware"),
+                         "firmware/20261016-152734/orbbec.log")
+        # 盘符与 .. 仍然被去掉
+        self.assertEqual(ep._arcname("C:/a/../b/x.log", "app"), "app/a/b/x.log")
+
+    def test_stage_merges_external_firmware(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, "root")
+            logs = os.path.join(root, "data", "logs")
+            _touch(os.path.join(logs, "EGOViewer_20261016141434.log"),
+                   _ts(2026, 10, 16, 15, 0, 0))
+            pulled = os.path.join(tmp, "work", "firmware", "20261016-152734")
+            _touch(os.path.join(pulled, "orbbec.log"), _ts(2026, 10, 16, 15, 27, 38))
+
+            out = os.path.join(tmp, "out")
+            _dest, collected = ep.stage(
+                root, out, ["app", "firmware"],
+                external={"firmware": [
+                    (os.path.join(pulled, "orbbec.log"), "20261016-152734/orbbec.log")]})
+            self.assertEqual(len(collected["app"]), 1)
+            self.assertEqual(len(collected["firmware"]), 1)
+            self.assertTrue(os.path.isfile(
+                os.path.join(out, "firmware", "20261016-152734", "orbbec.log")))
+
+    def test_external_category_filters_by_window(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = os.path.join(tmp, "20261016-152734")
+            _touch(os.path.join(d, "orbbec.log"), _ts(2026, 10, 16, 15, 27, 38))
+            _key, kept = ep.external_category(
+                "firmware", d, "",
+                start=_ts(2026, 10, 17), end=_ts(2026, 10, 18))
+            self.assertEqual(kept, [])
+            _key, kept = ep.external_category(
+                "firmware", d, "20261016-152734",
+                start=_ts(2026, 10, 16), end=_ts(2026, 10, 17))
+            self.assertEqual(len(kept), 1)
+            self.assertEqual(kept[0]["rel"], "20261016-152734/orbbec.log")
+
+
+    def test_stage_allows_external_already_inside_dest(self):
+        """外部日志已落在 dest_dir 内（源=目标）时不应报错：Windows 上 copy2 会 WinError 32。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = os.path.join(tmp, "dest")
+            d = os.path.join(dest, "firmware", "20261016-152734")
+            p = os.path.join(d, "orbbec.log")
+            _touch(p, _ts(2026, 10, 16, 15, 27, 38))
+            _dest, collected = ep.stage(
+                tmp, dest, ["firmware"],
+                external={"firmware": [(p, "20261016-152734/orbbec.log")]})
+            self.assertEqual(len(collected["firmware"]), 1)
+            self.assertTrue(os.path.isfile(p))
+
+
+def test_export_worker_has_no_channel_switch():
+    """固件日志只有一条来源（Orbbec SDK，与 EGOViewer 一致）：不能再有“固件日志来源”开关。"""
+    from ego_gui.device_tab import EgoOneClickExportWorker
+    w = EgoOneClickExportWorker("/tmp/root", "/tmp/out", ["firmware"])
+    assert not hasattr(w, "firmware_mode")
+    assert not hasattr(w, "file_cred")
+
+
+def test_export_worker_sdk_failure_is_fatal(monkeypatch):
+    """SDK 拉取失败要直接上报（RuntimeError），不允许静默回退或返回空列表。"""
+    import pytest
+    from ego_gui import device_tab as dt
+
+    class _Boom:
+        class OrbbecSdkError(RuntimeError):
+            pass
+
+        @staticmethod
+        def export_firmware_logs(*a, **k):
+            raise _Boom.OrbbecSdkError("device busy")
+
+        @staticmethod
+        def export_all_firmware_logs(*a, **k):
+            raise _Boom.OrbbecSdkError("device busy")
+
+    class _Cfg:
+        ORBBEC_SDK_PORT = 8090
+
+    w = dt.EgoOneClickExportWorker("/tmp/root", "/tmp/out", ["firmware"])
+    w.stage_kwargs = {"start": 0, "end": None}
+    with pytest.raises(RuntimeError, match="固件日志导出失败"):
+        w._pull_firmware("/tmp/fw", __import__("time").time(), _Boom, _Cfg)
+
+
+def test_ui_has_no_firmware_mode_selector():
+    """界面上不再有「固件日志来源」下拉框与文件服务账号行。"""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication, QLabel
+    import ego_gui.device_tab as dt
+
+    app = QApplication.instance() or QApplication([])
+    tab = dt.DeviceTab(lambda m: None, None)
+    assert not hasattr(tab, "cmb_firmware_mode")
+    assert not hasattr(tab, "row_fw_cred")
+    labels = [w.text() for w in tab.findChildren(QLabel)]
+    assert "固件日志来源" not in labels
+    assert "文件服务账号" not in labels
+    tab.deleteLater()
 
 
 if __name__ == "__main__":

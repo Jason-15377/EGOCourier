@@ -12,6 +12,10 @@
 没找到文件，则回退为在整个安装根目录下按文件名模式递归搜索，以适配未来版本
 目录结构调整。是否某目录是 EGOViewer 安装根目录，以存在 EGOViewer.exe（或
 data/logs）为稳定判据。
+
+可取消：collect/stage/pack_staged/discover 均接受可选 should_cancel 回调（默认
+不可取消）。回调在收集、复制、压缩的长循环检查点被调用，返回真则抛
+OperationCancelled 中断，供 UI 把"用户取消"与"真实失败"分开处理。
 """
 
 from __future__ import annotations
@@ -26,6 +30,20 @@ import zipfile
 from datetime import datetime
 
 from . import config
+
+
+class OperationCancelled(Exception):
+    """用户请求取消收集/打包时抛出，供 UI 线程识别为"已取消"而非失败。"""
+
+
+def _check_cancel(should_cancel):
+    """在长循环的检查点调用：should_cancel() 为真则中断当前任务。
+
+    仅在调用方传入回调时生效（默认 None = 不可取消）。
+    """
+    if should_cancel is not None and should_cancel():
+        raise OperationCancelled("操作已取消")
+
 
 # 三类日志：key / 界面简洁名 / zip 内子目录 / 常见相对路径 / 文件名规则 / 是否递归
 # firmware 目录下按拉取时间戳分子目录，递归收集并保留其相对子目录结构。
@@ -54,9 +72,12 @@ CATEGORIES = [
         "zip_dir": "firmware",
         "candidate_rel_dirs": ["data/firmware-logs", "firmware-logs"],
         "pattern": "*",
+        # 回退模式需覆盖设备侧三类固件日志（orbbec.log + messages.log* +
+        # observice.console.log*），避免目录结构变动后漏收。
         "fallback_pattern": "orbbec*.log*",
+        "fallback_patterns": ["orbbec*.log*", "messages.log*", "observice.console.log*"],
         "recursive": True,
-        "desc": "相机设备端固件日志（按拉取时间戳分子目录）",
+        "desc": "相机设备端固件日志（orbbec.log / messages.log* / observice.console.log*）",
     },
 ]
 
@@ -105,7 +126,7 @@ def find_ego_viewer_roots() -> list:
     return out
 
 
-def _gather(root: str, cat: dict) -> list:
+def _gather(root: str, cat: dict, should_cancel=None) -> list:
     """在某安装根目录下收集一个分类的日志文件。
 
     优先从 candidate_rel_dirs 中首个存在的目录收集；若都为空，则回退为在整个
@@ -119,6 +140,7 @@ def _gather(root: str, cat: dict) -> list:
             continue
         if cat.get("recursive"):
             for dirpath, _dirnames, filenames in os.walk(base):
+                _check_cancel(should_cancel)
                 for fn in filenames:
                     if not _matches(fn, cat["pattern"]):
                         continue
@@ -133,10 +155,11 @@ def _gather(root: str, cat: dict) -> list:
             break
     if not found:
         # 回退：整个根目录按模式递归找（firmware 用更精确的回退模式，避免误收非日志文件）
-        fb = cat.get("fallback_pattern", cat["pattern"])
+        pats = cat.get("fallback_patterns") or [cat.get("fallback_pattern", cat["pattern"])]
         for dirpath, _dirnames, filenames in os.walk(root):
+            _check_cancel(should_cancel)
             for fn in filenames:
-                if not _matches(fn, fb):
+                if not any(_matches(fn, p) for p in pats):
                     continue
                 full = os.path.join(dirpath, fn)
                 found.append({"abs": full, "rel": os.path.relpath(full, root)})
@@ -146,15 +169,30 @@ def _gather(root: str, cat: dict) -> list:
 def _name_stamp(rel: str):
     """尝试从文件名/目录名解析日志时间戳（epoch 秒），失败返回 None。
 
-    命名规则：EGOViewer_YYYYMMDDHHMMSS.log、OrbbecSDK.YYYYMMDDHHMMSS.log.txt、
-    固件时间戳目录 20260927-104153 等。
+    命名规则（按优先级）：
+    - EGO-4B 等设备按天命名的固件日志：orbbec_2026-10-14.log、orbbec_2026-10-14.log.1
+      （只有日期没有时刻，取当天 00:00 作为区间起点）
+    - 带秒级时间：EGOViewer_YYYYMMDDHHMMSS.log、OrbbecSDK.YYYYMMDDHHMMSS.log.txt、
+      固件拉取时间戳目录 20260927-104153
+    只认**文件名最后一段**里的时间，避免整条相对路径都命中目录名中的拉取时刻——
+    否则同一目录下的所有文件都会被判成同一时刻，时间筛选就失效了。
     """
-    m = re.search(r"(\d{8})[-_]?(\d{6})", rel)
+    name = os.path.basename(rel.replace("\\", "/"))
+    m = re.search(r"(\d{4})-(\d{2})-(\d{2})(?!\d)", name)
+    if m:
+        try:
+            return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3))).timestamp()
+        except ValueError:
+            pass
+    m = re.search(r"(\d{8})[-_]?(\d{6})", name)
     if m:
         try:
             return datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S").timestamp()
         except ValueError:
             return None
+    if rel.replace("\\", "/") != name:
+        # 文件名里没有时间，再看所在目录（如 20260927-104153/）
+        return _name_stamp(os.path.dirname(rel.replace("\\", "/")))
     return None
 
 
@@ -190,7 +228,7 @@ def _overlaps(start_stamp: float, end_stamp: float, start, end) -> bool:
     return True
 
 
-def discover(root: str, keys=None) -> dict:
+def discover(root: str, keys=None, should_cancel=None) -> dict:
     """返回某安装根目录下各分类发现的所有日志文件（含时间区间），每类按时间倒序。
 
     每个文件带 start_stamp/end_stamp（内容覆盖区间）、stamp（用于列表展示的时点，
@@ -200,11 +238,12 @@ def discover(root: str, keys=None) -> dict:
     keys = keys or [c["key"] for c in CATEGORIES]
     result = {}
     for cat in CATEGORIES:
+        _check_cancel(should_cancel)
         key = cat["key"]
         if key not in keys:
             result[key] = []
             continue
-        files = _gather(root, cat)
+        files = _gather(root, cat, should_cancel)
         for f in files:
             f["start_stamp"], f["end_stamp"], f["from_name"] = _file_stamp(f["abs"], f["rel"])
             f["stamp"] = f["start_stamp"]
@@ -241,7 +280,7 @@ def filter_firmware_pull(fw_paths: list, pulled_at: float,
 
 
 def collect(root: str, keys=None, max_age_days=None, max_count=None,
-            start=None, end=None, manual=None) -> dict:
+            start=None, end=None, manual=None, should_cancel=None) -> dict:
     """收集某安装根目录下各分类匹配到的日志文件（可按多种方式筛选）。
 
     筛选（可组合）：
@@ -263,9 +302,10 @@ def collect(root: str, keys=None, max_age_days=None, max_count=None,
             files.sort(key=lambda f: f["rel"])
             result[key] = files
         return result
-    disc = discover(root, keys)
+    disc = discover(root, keys, should_cancel)
     result = {}
     for key in keys:
+        _check_cancel(should_cancel)
         files = [f for f in disc.get(key, [])
                  if _within(f["start_stamp"], f["end_stamp"], max_age_days, start, end)]
         if max_count:
@@ -277,27 +317,91 @@ def collect(root: str, keys=None, max_age_days=None, max_count=None,
 
 
 def _arcname(rel: str, zip_dir: str) -> str:
-    """把相对路径归一化成安全 zip 内路径（去盘符/去 .. /防路径穿越），并挂在分类子目录下。"""
+    """把相对路径归一化成安全 zip 内路径（去盘符/去 .. /防路径穿越），并挂在分类子目录下。
+
+    相对路径里**合法的子目录要保留**（如固件日志的 <拉取时刻>/orbbec.log），只丢掉
+    “盘符”“..”“.”这类不安全或无语义的段；只有最后一段是文件名。
+    """
     segs = rel.replace("\\", "/").split("/")
-    clean = [os.path.basename(s) for s in segs if s and s not in (".", "..")]
-    return "/".join([zip_dir] + clean)
+    clean = [s for s in segs[:-1] if s and s not in (".", "..") and not s.endswith(":")]
+    name = os.path.basename(segs[-1]) if segs else ""
+    if not name or name in (".", ".."):
+        return zip_dir
+    return "/".join([zip_dir] + clean + [name])
+
+
+def external_category(key: str, local_dir: str, rel_prefix: str = "", max_age_days=None,
+                      start=None, end=None) -> tuple:
+    """把已落盘的外部日志目录包装成一个分类的 collect 结果（供 stage 一并复制）。
+
+    用于设备实时拉取的固件日志：它们不在 EGOViewer 安装目录下，由调用方先拉取到
+    local_dir（通常形如 <导出目录>/20261016-152734），这里只做时间筛选与归档。
+
+    rel_prefix 是归档时挂在文件名前的子目录（通常就是拉取时刻），最终 zip 内路径形如
+    firmware/<拉取时刻>/orbbec.log，与 EGOViewer 的 firmware-logs/<拉取时刻>/ 对应；
+    若传空串则 zip 内直接是 firmware/orbbec.log，不再多套一层。
+    """
+    files = []
+    if os.path.isdir(local_dir):
+        for dirpath, dirnames, filenames in os.walk(local_dir):
+            dirnames.sort()
+            for fn in sorted(filenames):
+                full = os.path.join(dirpath, fn)
+                rel = os.path.relpath(full, local_dir).replace("\\", "/")
+                if rel_prefix:
+                    rel = f"{rel_prefix.strip('/')}/{rel}"
+                files.append({"abs": full, "rel": rel})
+    kept = []
+    for f in files:
+        start_stamp, end_stamp, from_name = _file_stamp(f["abs"], f["rel"])
+        if _within(start_stamp, end_stamp, max_age_days, start, end):
+            kept.append({"abs": f["abs"], "rel": f["rel"], "from_name": from_name,
+                         "start_stamp": start_stamp, "end_stamp": end_stamp,
+                         "stamp": start_stamp})
+    kept.sort(key=lambda f: f["start_stamp"], reverse=True)
+    return key, kept
 
 
 def stage(root: str, dest_dir: str, keys=None, max_age_days=None, max_count=None,
-          start=None, end=None, manual=None, progress_cb=None) -> tuple:
+          start=None, end=None, manual=None, progress_cb=None, should_cancel=None,
+          external=None) -> tuple:
     """收集（含筛选）并把选中的日志复制到 dest_dir/<分类>/...，供打包与分析复用。
 
-    返回 (dest_dir, collected)。原始文件不改动。
+    返回 (dest_dir, collected)。原始文件不改动。should_cancel 在复制每个文件前检查，
+    便于长任务在收集/复制阶段被用户及时中断。
+
+    external：{分类key: [(abs, rel)]}，已在外部落盘的日志（如设备实时拉取的固件日志），
+    与 root 下收集到的同分类文件合并。rel 是相对该分类 zip 子目录的路径。
     """
-    collected = collect(root, keys, max_age_days, max_count, start, end, manual)
+    collected = collect(root, keys, max_age_days, max_count, start, end, manual,
+                        should_cancel=should_cancel)
+    for key, items in (external or {}).items():
+        if key not in collected:
+            continue
+        have = {os.path.abspath(f["abs"]) for f in collected[key]}
+        for abs_path, rel in items:
+            if os.path.abspath(abs_path) in have:
+                continue
+            start_stamp, end_stamp, from_name = _file_stamp(abs_path, rel)
+            collected[key].append({
+                "abs": abs_path, "rel": rel, "from_name": from_name,
+                "start_stamp": start_stamp, "end_stamp": end_stamp,
+                "stamp": start_stamp,
+            })
     os.makedirs(dest_dir, exist_ok=True)
     done = 0
     total = sum(len(v) for v in collected.values())
     for cat in CATEGORIES:
         key = cat["key"]
         for f in collected.get(key, []):
+            _check_cancel(should_cancel)
             arc = _arcname(f["rel"], cat["zip_dir"])
             target = os.path.join(dest_dir, *arc.split("/"))
+            if os.path.abspath(target) == os.path.abspath(f["abs"]):
+                # 源与目标同一路径（外部日志直接拉在 dest_dir 内）：无需复制，
+                # Windows 上 shutil.copy2 会报 WinError 32。
+                done += 1
+                continue
             os.makedirs(os.path.dirname(target), exist_ok=True)
             shutil.copy2(f["abs"], target)
             done += 1
@@ -346,6 +450,9 @@ def _manifest_lines(root: str, collected: dict, max_age_days, start=None, end=No
         key = cat["key"]
         n = len(collected.get(key, []))
         src = os.path.join(root, cat["candidate_rel_dirs"][0])
+        if key == "firmware" and n:
+            # 固件日志来自设备实时拉取（不在安装目录下），来源说明要写清楚
+            src = "设备实时拉取（Orbbec SDK 固件日志接口）"
         manifest["categories"].append({
             "key": key, "label": cat["label"], "source": src, "count": n,
         })
@@ -358,10 +465,11 @@ def _manifest_lines(root: str, collected: dict, max_age_days, start=None, end=No
 
 def pack_staged(staged_dir: str, out_dir: str, root: str, collected: dict,
                 prefix: str = "EGOViewer_logs", max_age_days=None,
-                start=None, end=None, progress_cb=None) -> str:
+                start=None, end=None, progress_cb=None, should_cancel=None) -> str:
     """把已 stage 到 staged_dir 的日志打包成 <out_dir>/<prefix>_<YYYYMMDD_HHMMSS>.zip。
 
-    返回 zip 绝对路径。未找到任何日志时抛 FileNotFoundError。
+    返回 zip 绝对路径。未找到任何日志时抛 FileNotFoundError。should_cancel 在每个
+    文件写入前检查；被取消时删除写了一半的 zip，不留残缺产物。
     """
     total = sum(len(v) for v in collected.values())
     if total == 0:
@@ -372,15 +480,25 @@ def pack_staged(staged_dir: str, out_dir: str, root: str, collected: dict,
 
     manifest, lines = _manifest_lines(root, collected, max_age_days, start, end)
     written = 0
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for dirpath, _dirnames, filenames in os.walk(staged_dir):
-            for fn in filenames:
-                full = os.path.join(dirpath, fn)
-                rel = os.path.relpath(full, staged_dir).replace("\\", "/")
-                zf.write(full, rel)
-                written += 1
-                if progress_cb and total:
-                    progress_cb(60 + int(written * 40 / total))
-        zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
-        zf.writestr("说明.txt", "\n".join(lines))
+    try:
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for dirpath, _dirnames, filenames in os.walk(staged_dir):
+                for fn in filenames:
+                    _check_cancel(should_cancel)
+                    full = os.path.join(dirpath, fn)
+                    rel = os.path.relpath(full, staged_dir).replace("\\", "/")
+                    zf.write(full, rel)
+                    written += 1
+                    if progress_cb and total:
+                        progress_cb(60 + int(written * 40 / total))
+            zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+            zf.writestr("说明.txt", "\n".join(lines))
+    except BaseException:
+        # 取消或异常：不留下写到一半的 zip（打包与导出共用输出目录，残缺包会被误当成结果）
+        try:
+            if os.path.exists(zip_path):
+                os.remove(zip_path)
+        except OSError:
+            pass
+        raise
     return zip_path

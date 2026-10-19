@@ -4,8 +4,9 @@
 - SSH 设备实时拉取 app 日志（SSH/SFTP，勾选「app 日志」后填写 SSH 账户）
 - EGOViewer 三类日志（app/sdk/firmware）一键导出 / 打包
 底部「开始一键导出」：识别 EGOViewer 根目录 → 全新时间戳目录收集勾选分类，
-勾选 firmware 时通过 Orbbec SDK 从设备实时拉取最新固件日志（等价 EGOviewer
-「导出设备日志」）→ 导入分析 + 报告；「打包导出」：按筛选/手动勾选打包成 zip。
+勾选 firmware 时通过 Orbbec SDK 从设备实时拉取最新固件日志（与 EGOViewer「导出日志」
+同一条接口，默认方式；失败即报错，不静默换通道）→ 导入分析 + 报告；
+「打包导出」按筛选/手动勾选打包成 zip，勾选 firmware 时同样实时拉取。
 """
 
 from __future__ import annotations
@@ -175,26 +176,58 @@ class EvLogPackWorker(QThread):
     progress = Signal(int)              # 0..100
     status = Signal(str)                # 文本行（写入底部日志框）
     done = Signal(str, object, str)     # zip 绝对路径, session_id(可能 None), report_path(可能 "")
+    cancelled = Signal()                # 用户取消（非失败）
     failed = Signal(str)
 
     def __init__(self, root, out_dir, keys, stage_kwargs=None, auto_import=False,
-                 auto_report=False, prefix="EGOViewer_logs"):
+                 auto_report=False, prefix="EGOViewer_logs",
+                 device_host="", sdk_port=None):
         super().__init__()
         self.root, self.out_dir, self.keys = root, out_dir, keys
         self.stage_kwargs = dict(stage_kwargs or {})
         self.auto_import = auto_import
         self.auto_report = auto_report
         self.prefix = prefix
+        self.device_host = device_host
+        self.sdk_port = sdk_port
+        self.cancel_event = threading.Event()
+
+    def cancel(self):
+        self.cancel_event.set()
+
+    def _want_cancel(self) -> bool:
+        return self.cancel_event.is_set()
 
     def run(self):
         import shutil
         import tempfile
+        from ego_relay import config, orbbec_sdk
         work = tempfile.mkdtemp(prefix="evlog_")
+        # 设备拉取的固件日志先落在 work 之外的暂存目录，再由 stage 复制进 work/<分类>/，
+        # 否则源路径与 stage 目标路径相同，Windows 上 shutil.copy2 会报 WinError 32。
+        pull_work = tempfile.mkdtemp(prefix="evlog_fw_")
         try:
+            external = {}
+            # firmware 与「一键导出」同一条通道：经 Orbbec SDK 从设备实时拉取，
+            # 失败即中止，不回退到别的通道或本机旧产物。
+            if "firmware" in self.keys:
+                pull_at = time.time()
+                fw_root = os.path.join(pull_work, "firmware")
+                puller = EgoOneClickExportWorker(
+                    self.root, pull_work, ["firmware"], stage_kwargs=self.stage_kwargs,
+                    device_host=self.device_host, sdk_port=self.sdk_port)
+                puller.status.connect(self.status.emit)
+                puller.progress.connect(lambda pct: self.progress.emit(int(pct * 0.5)))
+                puller.cancel_event = self.cancel_event
+                paths = puller._pull_firmware(fw_root, pull_at, orbbec_sdk, config)
+                if paths:
+                    external["firmware"] = list(paths)
             self.status.emit("收集并筛选日志…")
             _staged, collected = evlog_pack.stage(
                 self.root, work, self.keys,
-                progress_cb=lambda pct: self.progress.emit(pct),
+                progress_cb=lambda pct: self.progress.emit(int(pct * 0.5)),
+                should_cancel=self._want_cancel,
+                external=external,
                 **self.stage_kwargs)
             n = sum(len(v) for v in collected.values())
             if n == 0:
@@ -205,7 +238,8 @@ class EvLogPackWorker(QThread):
                 max_age_days=self.stage_kwargs.get("max_age_days"),
                 start=self.stage_kwargs.get("start"),
                 end=self.stage_kwargs.get("end"),
-                progress_cb=lambda pct: self.progress.emit(pct))
+                progress_cb=lambda pct: self.progress.emit(pct),
+                should_cancel=self._want_cancel)
             self.status.emit(f"打包完成：{zip_path}")
 
             sid, report_path = None, ""
@@ -234,10 +268,54 @@ class EvLogPackWorker(QThread):
                 self.status.emit("所选日志不含可分析来源（app/固件），跳过导入")
             self.progress.emit(100)
             self.done.emit(zip_path, sid, report_path)
+        except evlog_pack.OperationCancelled:
+            self.status.emit("打包已取消")
+            self.cancelled.emit()
         except Exception as e:  # noqa: BLE001
             self.failed.emit(str(e))
         finally:
             shutil.rmtree(work, ignore_errors=True)
+            shutil.rmtree(pull_work, ignore_errors=True)
+
+
+def _pull_firmware_from_device(fw_root, at, sdk_root, orbbec_sdk, config,
+                               status=None, progress=None, cancel_event=None,
+                               device_host="", port=None) -> list:
+    """从**所有已连接设备**各拉一份固件日志到 fw_root，返回 [(路径, 相对rel)]。
+
+    目录结构对齐设备名分类：fw_root/<设备名>/<拉取时刻>/<设备侧原文件名>。
+    与 EGOViewer「导出日志」一致：走 Orbbec SDK 固件日志回调接口。全部设备都失败时
+    抛 RuntimeError 中止导出；部分失败会逐台提示，成功的照常保留。
+    """
+    emit = status or (lambda _t: None)
+    prog = progress or (lambda _p: None)
+    pull_name = datetime.fromtimestamp(at).strftime("%Y%m%d-%H%M%S")
+    emit("通过 Orbbec SDK 从设备实时拉取固件日志（与 EGOViewer「导出日志」一致）…"
+         "（保持设备连接）")
+    try:
+        result = orbbec_sdk.export_all_firmware_logs(
+            fw_root, sdk_root=sdk_root,
+            cancel_event=cancel_event,
+            note_cb=emit,
+            progress_cb=lambda pct, name: prog(pct))
+    except orbbec_sdk.OrbbecSdkError as e:
+        if cancel_event is not None and cancel_event.is_set():
+            raise evlog_pack.OperationCancelled("操作已取消") from e
+        raise RuntimeError(
+            f"固件日志导出失败，请确认设备已连接、EGOviewer 未占用设备：{e}") from e
+    out = []
+    for folder, info in result.get("ok", {}).items():
+        for p in info.get("paths", []):
+            out.append((p, f"{folder}/{pull_name}/{os.path.basename(p)}"))
+        emit(f"设备 {folder}：{len(info.get('paths', []))} 个文件")
+    errors = result.get("errors") or []
+    if not out:
+        detail = "；".join(f"{e.get('name') or '未知设备'}: {e.get('error')}" for e in errors)
+        raise RuntimeError("所有设备均未拉取到固件日志" + (f"（{detail}）" if detail else ""))
+    if errors:
+        emit(f"有 {len(errors)} 台设备拉取失败，其余设备产物已保留："
+             + "；".join(f"{e.get('name') or '未知设备'}（{e.get('error')}）" for e in errors))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -250,24 +328,84 @@ class EgoOneClickExportWorker(QThread):
     progress = Signal(int)              # 0..100
     status = Signal(str)                # 文本行（写入底部日志框）
     done = Signal(str, object, str)     # export_dir, session_id(可能 None), report_path(可能 "")
+    cancelled = Signal()                # 用户取消（非失败）
     failed = Signal(str)
 
     def __init__(self, root, out_dir, keys, stage_kwargs=None,
-                 auto_import=False, auto_report=False):
+                 auto_import=False, auto_report=False,
+                 device_host="", sdk_port=None):
         super().__init__()
         self.root, self.out_dir, self.keys = root, out_dir, keys
         self.stage_kwargs = dict(stage_kwargs or {})
         self.auto_import = auto_import
         self.auto_report = auto_report
+        # 固件日志只有一条来源：Orbbec SDK 固件日志回调（与 EGOViewer「导出日志」一致）。
+        self.device_host = device_host
+        self.sdk_port = sdk_port
+        self.cancel_event = threading.Event()
+
+    def cancel(self):
+        self.cancel_event.set()
+
+    def _want_cancel(self) -> bool:
+        return self.cancel_event.is_set()
+
+    def _pull_firmware(self, fw_root, pull_at, orbbec_sdk, config) -> list:
+        """经 Orbbec SDK 实时拉取**所有已连接设备**的固件日志。
+
+        返回 [(绝对路径, 相对 firmware/ 的路径)]，相对路径形如
+        <设备名>/<拉取时刻>/<设备侧原文件名>，即按设备名分类。
+        整个时间段不命中时返回空列表（并提示）；取消抛 OperationCancelled；
+        全部设备失败时抛 RuntimeError 中止，不换通道——避免产物来源不明。
+        """
+        start = self.stage_kwargs.get("start")
+        end = self.stage_kwargs.get("end")
+        pull_name = datetime.fromtimestamp(pull_at).strftime("%Y%m%d-%H%M%S")
+
+        _kept, _stamp, within = evlog_pack.filter_firmware_pull(
+            [], pull_at, start=start, end=end)
+        if not within:
+            self.status.emit(
+                f"本次固件日志拉取时间 {pull_name} 不在所选时间段内，跳过 firmware"
+                "（如需包含请调整时间段）")
+            return []
+        items = _pull_firmware_from_device(
+            fw_root, pull_at, self.root, orbbec_sdk, config,
+            status=self.status.emit,
+            progress=lambda pct: self.progress.emit(50 + int(pct * 0.5)),
+            cancel_event=self.cancel_event,
+            device_host=self.device_host, port=self.sdk_port)
+        # 固件日志的时间判定统一按「本次拉取时刻」，与 per-file 无关，这里只做整体命中判定
+        return items
+
+    @staticmethod
+    def _fmt_range(start, end):
+        def _f(v):
+            return datetime.fromtimestamp(v).strftime("%Y-%m-%d %H:%M:%S") if v else "不限"
+        return f"{_f(start)} ～ {_f(end)}"
 
     def run(self):
-        from ego_relay import orbbec_sdk, sftp_pull, export as export_mod, db, config
+        from ego_relay import (orbbec_sdk, export as export_mod, db, config,
+                               sftp_pull)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         export_dir = os.path.join(self.out_dir, f"EGO_export_{ts}")
         try:
             self.status.emit(f"识别 EGOViewer 根目录：{self.root}")
             os.makedirs(export_dir, exist_ok=True)
             collected = {}
+            # firmware 先拉：失败要尽早中止，不要先把本机日志复制一遍再报错。
+            #   所有已连接设备都拉，按设备名分类落盘：
+            #   <导出目录>/firmware/<设备名>/<拉取时刻>/orbbec_2026-10-14.log
+            if "firmware" in self.keys:
+                if self._want_cancel():
+                    raise evlog_pack.OperationCancelled("操作已取消")
+                pull_at = time.time()
+                fw_root = os.path.join(export_dir, "firmware")
+                fw_items = self._pull_firmware(fw_root, pull_at, orbbec_sdk, config)
+                if fw_items:
+                    collected["firmware"] = [
+                        {"abs": p, "rel": rel, "from_name": True}
+                        for p, rel in fw_items]
             # app/sdk：从本机 EGOViewer 根目录收集（进度 0–50），按当前筛选方式应用时间/手动筛选
             app_sdk = [k for k in self.keys if k != "firmware"]
             if app_sdk:
@@ -275,40 +413,9 @@ class EgoOneClickExportWorker(QThread):
                 _staged, c = evlog_pack.stage(
                     self.root, export_dir, app_sdk,
                     progress_cb=lambda pct: self.progress.emit(int(pct * 0.5)),
+                    should_cancel=self._want_cancel,
                     **self.stage_kwargs)
                 collected.update(c)
-            # firmware：像 EGOviewer「导出设备日志」一样，通过 Orbbec SDK 从设备实时拉取最新固件日志。
-            # 拉取的固件日志文件名由设备给出、通常不含时间戳，故按其「拉取时间戳」放进同名子目录，
-            # 再按当前时间段筛选：拉取时刻不落在窗口内则整批跳过（与 app/sdk 的窗口判定一致）。
-            if "firmware" in self.keys:
-                pull_at = time.time()
-                pull_name = datetime.fromtimestamp(pull_at).strftime("%Y%m%d-%H%M%S")
-                _kept, _stamp, within = evlog_pack.filter_firmware_pull(
-                    [], pull_at,
-                    start=self.stage_kwargs.get("start"),
-                    end=self.stage_kwargs.get("end"))
-                if not within:
-                    self.status.emit(
-                        f"本次固件日志拉取时间 {pull_name} 不在所选时间段内，跳过 firmware（如需包含请调整时间段或改用手动勾选）")
-                else:
-                    self.status.emit("通过 Orbbec SDK 从设备实时拉取固件日志…（保持设备连接）")
-                    fw_dir = os.path.join(export_dir, "firmware", pull_name)
-                    try:
-                        fw_paths = orbbec_sdk.export_firmware_logs(
-                            fw_dir, sdk_root=self.root, device_ip="",
-                            device_port=config.ORBBEC_SDK_PORT,
-                            progress_cb=lambda pct, name: self.progress.emit(50 + int(pct * 0.5)))
-                    except orbbec_sdk.OrbbecSdkError as e:
-                        raise RuntimeError(
-                            f"固件日志导出失败，请确认设备已连接、EGOviewer 未占用设备：{e}") from e
-                    fw_paths, _stamp, _within = evlog_pack.filter_firmware_pull(
-                        fw_paths, pull_at,
-                        start=self.stage_kwargs.get("start"),
-                        end=self.stage_kwargs.get("end"))
-                    collected["firmware"] = [
-                        {"abs": p,
-                         "rel": os.path.join(pull_name, os.path.basename(p)),
-                         "from_name": True} for p in fw_paths]
             n = sum(len(v) for v in collected.values())
             if n == 0:
                 # 区分"没有日志"与"被时间段筛掉了"：后者多发生在默认时间段不含旧日志时，
@@ -348,6 +455,9 @@ class EgoOneClickExportWorker(QThread):
                 self.status.emit("所选日志不含可分析来源（app/固件），跳过导入")
             self.progress.emit(100)
             self.done.emit(export_dir, sid, report_path)
+        except evlog_pack.OperationCancelled:
+            self.status.emit("一键导出已取消")
+            self.cancelled.emit()
         except Exception as e:  # noqa: BLE001
             self.failed.emit(str(e))
 
@@ -939,6 +1049,7 @@ class DeviceTab(QWidget):
         v.addWidget(pk_chk_w, r, 1, 1, 5)
         r += 1
 
+
         # --- 任务进度 + 执行按钮（同一行：进度条居左，按钮靠右） ---
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
@@ -1203,10 +1314,12 @@ class DeviceTab(QWidget):
             root, out_dir, keys,
             stage_kwargs=filters,
             auto_import=self.chk_import.isChecked(),
-            auto_report=self.chk_report.isChecked())
+            auto_report=self.chk_report.isChecked(),
+            device_host=self.edit_ip.text().strip())
         self._export_worker.progress.connect(self.progress.setValue)
         self._export_worker.status.connect(self._append)
         self._export_worker.done.connect(self._on_export_done)
+        self._export_worker.cancelled.connect(self._on_export_cancelled)
         self._export_worker.failed.connect(self._on_export_fail)
         self._export_worker.finished.connect(self._on_export_finished)
         self._export_worker.start()
@@ -1260,6 +1373,11 @@ class DeviceTab(QWidget):
             QDateTime.fromSecsSinceEpoch(int(min(stamps)) - 1))
         self.edit_range_end.setDateTime(QDateTime.currentDateTime())
         self._update_pack_counts()
+
+    def _on_export_cancelled(self):
+        self.progress.setValue(0)
+        self._append("一键导出已取消")
+        self.log("一键导出已取消")
 
     def _on_export_finished(self):
         self.btn_export.setEnabled(True)
@@ -1366,16 +1484,16 @@ class DeviceTab(QWidget):
             # 同步更新 hover Tooltip 里的文件数量
             chk = self._pack_checks.get(key)
             if chk is not None:
-                src = "（导出时从设备实时拉取）" if key == "firmware" else self._pack_sources.get(key, "")
+                src = ("（设备实时拉取，Orbbec SDK，与 EGOViewer 一致）" if key == "firmware"
+                       else self._pack_sources.get(key, ""))
                 tip = f"来源路径：{src}\n文件数量：{txt}"
                 chk.setToolTip(tip)   # 仅复选框带 Tooltip，数量标签不弹提示
 
     def _firmware_count_text(self, filters):
-        """固件日志计数文案：说明它是实时拉取，并判断当前时间段是否会命中。
+        """固件日志计数文案：设备实时拉取，无法预先知道设备上有几个文件。
 
-        取本次导出动作时刻（即当前时刻）代入时间段判定，等价于导出时 firmware 分支的
-        `filter_firmware_pull([], now, start, end)` 结果，保证"显示"与"导出"口径一致。
-        手动勾选模式下仍需有时间窗口；无窗口时（理论上不会）按命中处理。
+        导出那一刻经 Orbbec SDK 拉取，按本次拉取时刻判定当前时间段是否命中；
+        本机 EGOViewer 的 data/firmware-logs 是历史产物，不参与导出。
         """
         start, end = filters.get("start"), filters.get("end")
         if self.cmb_filter.currentData() != "range":
@@ -1513,15 +1631,17 @@ class DeviceTab(QWidget):
         self.btn_pack.setEnabled(False)
         self.btn_export.setEnabled(False)
         self.btn_stop.setEnabled(True)
-        self.log(f"开始打包本地 EGOViewer 日志：{root} → {out_dir}")
+        self.log(f"开始打包日志：{root} → {out_dir}（勾选 {'/'.join(keys)}）")
         self._pack_worker = EvLogPackWorker(
             root, out_dir, keys,
             stage_kwargs=filters,
             auto_import=self.chk_import.isChecked(),
-            auto_report=self.chk_report.isChecked())
+            auto_report=self.chk_report.isChecked(),
+            device_host=self.edit_ip.text().strip())
         self._pack_worker.progress.connect(self.progress.setValue)
         self._pack_worker.status.connect(self._append)
         self._pack_worker.done.connect(self._on_pack_done)
+        self._pack_worker.cancelled.connect(self._on_pack_cancelled)
         self._pack_worker.failed.connect(self._on_pack_fail)
         self._pack_worker.finished.connect(self._on_pack_finished)
         self._pack_worker.start()
@@ -1548,18 +1668,33 @@ class DeviceTab(QWidget):
         self._append(f"[错误] 打包失败: {err}")
         self.log(f"本地日志打包失败: {err}")
 
+    def _on_pack_cancelled(self):
+        self.progress.setValue(0)
+        self._append("打包已取消")
+        self.log("本地日志打包已取消")
+
     def _on_pack_finished(self):
         self.btn_pack.setEnabled(True)
         self.btn_export.setEnabled(True)
         self.btn_stop.setEnabled(False)
 
     def _stop(self):
+        """取消任务：向当前运行中的导出/打包 worker 发出取消请求。
+
+        cancel() 只置位事件（非阻塞），worker 在下一个检查点（收集/复制/压缩之间）
+        抛出 OperationCancelled，经 cancelled 信号回到本页做 UI 复位；实际收尾由
+        worker 的 finished 信号（_on_*_finished）统一恢复按钮状态。
+        """
         if self._export_worker and self._export_worker.isRunning():
-            self._append("导出进行中，暂不支持中途取消（可等待完成或关闭窗口）")
-            self.log("导出进行中，无法中途取消")
+            self._export_worker.cancel()
+            self.btn_stop.setEnabled(False)
+            self._append("已请求取消一键导出，等待当前步骤结束…")
+            self.log("已请求取消一键导出")
         elif self._pack_worker and self._pack_worker.isRunning():
-            self._append("打包进行中，暂不支持中途取消（可等待完成或关闭窗口）")
-            self.log("打包进行中，无法中途取消")
+            self._pack_worker.cancel()
+            self.btn_stop.setEnabled(False)
+            self._append("已请求取消打包，等待当前步骤结束…")
+            self.log("已请求取消本地日志打包")
         elif self._dp_worker and self._dp_worker.isRunning():
             self._dp_worker.cancel()
             self.progress.setValue(0)
