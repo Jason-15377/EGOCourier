@@ -1,0 +1,19 @@
+# EGO Courier 桌面版运行依赖（由 EGO Courier.bat / bootstrap.py 自动安装）
+#
+# Python 版本要求：3.10 – 3.12（推荐 3.12）。
+# Python 3.13 起 PySide6 轮子覆盖不全、matplotlib 也常有缺失，
+# 装不上时会看到满屏红字，bootstrap 会明确提示改用 3.12。
+#
+# 安装：python -m pip install -r requirements.txt
+# 或直接双击 EGO Courier.bat（会建 .venv 并自动装好）。
+
+PySide6>=6.6,<6.9
+matplotlib>=3.7,<3.11
+numpy>=1.24,<2.3
+
+# MCAP 视频支持（可选，缺失时仅 MCAP 分析不可用）
+mcap>=1.1
+mcap-ros2-support>=0.5
+
+# 设备 SSH/SFTP app 日志通道：界面暂未开放，但 ego_relay/sftp_client.py 是硬导入
+paramiko>=3.4

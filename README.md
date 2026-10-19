@@ -9,16 +9,45 @@
 | **桌面版** | `EGO Courier.bat` 或 `python run_desktop.py` | PySide6 桌面 GUI：设备与日志工作台（BLE 配网、EGOViewer 三类日志一键导出 / 勾选导出）+ 会话/分析页面 |
 | **命令行** | `ego <子命令>` 或 `python -m ego_relay.cli` | 导入/查询/导出/阈值/WiFi 等 |
 
-**纯 Python 实现**。核心包零第三方依赖（stdlib）；桌面版依赖 PySide6、matplotlib、imageio、paramiko（见下）。
+**纯 Python 实现**。核心包零第三方依赖（stdlib）；桌面版依赖 PySide6、matplotlib、numpy、paramiko、mcap（清单见 `requirements.txt`）。
 
 ## 桌面版（GUI）说明
 
-依赖安装（一次）：
+**环境要求：Python 3.10–3.12（推荐 3.12）。** 3.13 及以上暂无 PySide6 / matplotlib
+预编译包，装依赖会失败——启动器会提前拦下并提示改用 3.12。
+
+依赖安装：**首次启动自动完成**。双击 `EGO Courier.bat` 后，启动器会自己完成：
+
+1. 找到本机的 Python（优先 3.12 / 3.11 / 3.10）；
+2. 在本目录建独立环境 `.venv`（不污染系统 Python）；
+3. 按 `requirements.txt` 只补装缺失的依赖（约 200MB，1–10 分钟）；
+4. 启动界面。之后再启动会跳过以上步骤，直接打开。
+
+装不上时窗口**不会闪退**，会给出中文原因（Python 版本过新 / 网络不通 / 无写入权限 /
+磁盘空间不足）与处理办法，完整输出在 `log\install.log`。
+
+可选：公司网络访问 PyPI 不通时，先设置内网镜像再双击启动：
+
 ```bat
-python -m pip install PySide6 matplotlib imageio paramiko
+set EGO_PIP_INDEX_URL=https://<内网 PyPI 镜像>/simple
 ```
 
-启动：双击 `EGO Courier.bat`（或 `python run_desktop.py`）。
+手动安装（不用启动器时）：
+
+```bat
+python -m pip install -r requirements.txt
+```
+
+启动：双击 `EGO Courier.bat`（或 `python run_desktop.py`，后者要求依赖已装好）。
+
+启动器诊断命令：
+
+```bat
+python bootstrap.py --check          :: 只体检，打印各依赖版本，不安装不启动
+python bootstrap.py --no-install     :: 缺依赖直接报错，适合排查环境问题
+python bootstrap.py --reinstall      :: 强制重装全部依赖
+python bootstrap.py --system-python  :: 不用 .venv，直接用系统 Python
+```
 
 - **日志分析 Tab**（导入 + 综合分析 + 可视化，功能化布局、无“概览/KPI 卡片”风格）：
   - 选择本地日志文件夹或 zip → 开始分析。后台同时跑两条管线：
@@ -46,11 +75,11 @@ python -m pip install PySide6 matplotlib imageio paramiko
 ## 一键启动
 
 ```bat
-:: 启动桌面 GUI
+:: 启动桌面 GUI（首次会自动建 .venv 并安装依赖）
 EGO Courier.bat
 ```
 
-或者命令行：
+或者命令行（依赖已装好后）：
 ```bat
 python run_desktop.py
 ```
@@ -148,8 +177,11 @@ EGOCourier/
 ├── packaging/entry.py  PyInstaller 打包入口
 ├── tests/              单元测试 + GUI 冒烟测试
 ├── data/               运行数据（DB、导出、临时解压）
-├── EGO Courier.bat     启动桌面 GUI
-├── run_desktop.py      桌面 GUI 启动器（python run_desktop.py）
+├── .venv/              首次启动自动创建的运行环境（不入库）
+├── requirements.txt    桌面版依赖清单（启动器据此自动安装）
+├── bootstrap.py        启动器：找 Python → 建 .venv → 装依赖 → 启动
+├── EGO Courier.bat     启动桌面 GUI（推荐入口）
+├── run_desktop.py      直接启动 GUI（要求依赖已装好）
 ├── build_exe.bat       打包 .exe（onedir / onefile）
 ├── ego_courier.spec    PyInstaller 打包配置
 ├── ego.bat             CLI 包装
