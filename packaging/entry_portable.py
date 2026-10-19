@@ -99,12 +99,53 @@ def main() -> int:
 
         return _fatal("启动失败", "加载界面失败。", traceback.format_exc())
 
+    ms = _selftest_ms()
+    if not ms:
+        try:
+            return gui_main()
+        except Exception:
+            import traceback
+
+            return _fatal("运行中断", "程序运行时发生未处理的异常。", traceback.format_exc())
+
+    # 自检：singleShot(0) 在事件循环启动后立刻触发，此时再挂 3 秒退出计时，
+    # 避免 QTimer 在 loop 启动前就到期（那种写法会一直卡在事件循环里）。
+    from PySide6.QtCore import QTimer
+    from PySide6.QtWidgets import QApplication
+
+    import ego_gui.main as _m
+
+    _orig_exec = QApplication.exec
+
+    def _exec_with_timeout():
+        app = QApplication.instance()
+        QTimer.singleShot(0, lambda: QTimer.singleShot(ms, app.quit))
+        return _orig_exec()
+
     try:
-        return gui_main()
+        # QApplication.exec 在 PySide6 里是 staticmethod，替换时须保持同样的描述符
+        QApplication.exec = staticmethod(_exec_with_timeout)
+    except (TypeError, AttributeError):
+        return _fatal("自检失败", "无法挂载自检退出计时（该环境不支持替换 exec）。")
+
+    try:
+        return _m.main()
     except Exception:
         import traceback
 
         return _fatal("运行中断", "程序运行时发生未处理的异常。", traceback.format_exc())
+
+
+def _selftest_ms() -> int:
+    """``EGO_SELFTEST_EXIT_MS``：打包自检用，界面起来后自动退出。
+
+    没有它就只能在发布脚本里人眼看窗口，CI/脚本无法判断「能启动」。
+    非自检场景该变量不存在，行为与普通启动完全一致。
+    """
+    try:
+        return max(0, int(os.environ.get("EGO_SELFTEST_EXIT_MS", "") or 0))
+    except ValueError:
+        return 0
 
 
 if __name__ == "__main__":

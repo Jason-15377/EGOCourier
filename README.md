@@ -6,10 +6,15 @@
 
 | 形态 | 入口 | 说明 |
 |---|---|---|
-| **桌面版** | `EGO Courier.bat` 或 `python run_desktop.py` | PySide6 桌面 GUI：设备与日志工作台（BLE 配网、EGOViewer 三类日志一键导出 / 勾选导出）+ 会话/分析页面 |
-| **命令行** | `ego <子命令>` 或 `python -m ego_relay.cli` | 导入/查询/导出/阈值/WiFi 等 |
+| **桌面版** | `EGO Courier.bat` 或 `python run_desktop.py` | PySide6 桌面 GUI：日志导出工作台（BLE 配网、EGOViewer 三类日志一键导出 / 勾选导出）+ 会话记录 / 日志分析 / Trace 查询 |
+| **命令行** | `ego <子命令>` 或 `python -m ego_relay.cli` | 导入/查询/导出/阈值/WiFi 等（`ego.bat` 是对应的批处理包装） |
+| **便携版** | `EGO Courier.exe`（见 [GitHub Releases](https://github.com/Jason-15377/EGOCourier/releases)） | 自带 Python 与全部依赖，目标机器无需安装任何东西；解压即用 |
 
 **纯 Python 实现**。核心包零第三方依赖（stdlib）；桌面版依赖 PySide6、matplotlib、numpy、paramiko、mcap（清单见 `requirements.txt`）。
+
+桌面 GUI 共四个页签：**日志导出**（BLE 配网 + EGOViewer 三类日志收集 / 勾选打包）、**会话记录**（多选删除 / 对比 / 导出汇总）、**日志分析**（对齐 + 异常检测 + 可视化）、**Trace 查询**。
+
+## 桌面版（GUI）说明
 
 ## 桌面版（GUI）说明
 
@@ -99,8 +104,47 @@ build_portable.bat       :: → dist\EGO Courier\EGO Courier.exe + runtime\
 ```
 
 便携版把依赖摊在 `runtime\`、源码明文放在 `runtime\app\`，**现场改 `.py` 重启即生效、
-不用重新打包**，适合交给测试同事。见 [README_便携版.md](README_便携版.md)；
-方式一详见 [README_桌面端.md](README_桌面端.md#打包成-exe另一版启动方式)。
+不用重新打包**，适合交给测试同事；正式分发用 `package_portable_release.bat` 打成
+`dist\EGO_Courier_portable_<版本>_win64.zip`，上传到 GitHub Releases。
+
+`onedir` 与 `onefile` 的取舍：onedir 启动快、杀软误报少，推荐分发整个目录；
+onefile 只有一个约 80MB 的 exe，但每次启动要解压到临时目录，稍慢且误报相对更多。
+UPX 压缩在 spec 中已关闭，避免提高误报率。
+
+### 打包说明
+
+- **图标**：`assets\ego_courier.ico` 含 16/20/24/32/40/48/64/96/128/256 共 10 种尺寸
+  （每种尺寸 PNG + BMP 两帧，共 20 帧），同时写进 exe 资源（资源管理器/任务栏/开始菜单）
+  并由程序在运行时加载为窗口图标。
+- **数据目录**：源码模式数据在项目根的 `data\`；打包后默认放在 **exe 同级目录的 `data\`**
+  （不能用临时解压目录，否则退出即丢），随程序目录整体迁移。如需指定别处，启动前设置
+  环境变量 `EGO_DATA_ROOT=<目录>`。
+- **ffmpeg / ffprobe 不打进包**：只在做视频分析（MP4/MCAP）时需要，程序启动时会自动从
+  PATH 或 winget 安装目录探测；缺失时界面会提示安装方式，日志/CSV 分析不受影响。
+- **OrbbecSDK.dll 不打进包**：固件日志实时导出时，从用户机器上已装的 EGOViewer 目录里查找，
+  避免随包分发造成 SDK 版本错配。
+
+## 标志（Logo）
+
+标志生成脚本：`assets\make_logo.py`（依赖 Pillow）。改了配色/造型后重新生成，两个打包
+脚本也会在打包前自动重新生成一次：
+
+```bat
+python assets\make_logo.py
+```
+
+设计要点：深蓝圆角方底板 + 两道朝右上的箭头（白色主箭头 + 青色次级箭头），
+箭头取「Courier 送达」语义，尾部短横线抽象三类日志（app/sdk/firmware）；
+低分辨率（≤32px）自动走简化路径去掉短横线，保证任务栏 16px 下仍清晰可辨。
+
+| 文件 | 用途 |
+|---|---|
+| `assets\ego_courier.ico` | Windows 多分辨率图标（exe 资源 + 窗口/任务栏） |
+| `assets\logo.png` / `logo_512.png` | 512px 主标志（文档 / 关于页） |
+| `assets\logo_<n>.png` | 16–256 各尺寸透明底 PNG（界面内小图标用） |
+
+> 若 `assets\` 缺失（例如只拷了 `.py` 文件），程序会自动退回代码内绘制的矢量图标，
+> 窗口图标不会为空。
 
 ## 命令行工具（ego）
 
