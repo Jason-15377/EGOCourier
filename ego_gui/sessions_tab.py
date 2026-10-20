@@ -26,6 +26,7 @@ from ego_relay import analysis, db, config, export as export_mod
 from ego_relay import compare as compare_mod
 from . import charts as charts_mod
 from . import report as report_mod
+from . import session_view
 
 
 def _fmt(us):
@@ -544,13 +545,16 @@ class SessionsTab(QWidget):
         top.addWidget(self.btn_refresh)
         top.addWidget(self.btn_open)
         lv.addLayout(top)
-        self.sess_table = QTableWidget(0, 8)
+        self.sess_table = QTableWidget(0, 9)
         self.sess_table.setHorizontalHeaderLabels(
-            ["", "ID", "设备", "名称", "帧", "异常", "trace_id", "开始时间"])
+            ["", "导出批次", "来源", "设备 SN", "数据", "帧数", "异常", "trace_id", "导出时间"])
         self.sess_table.setColumnWidth(0, 34)
-        self.sess_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        for col, w in ((1, 230), (2, 90), (3, 150), (4, 70), (5, 110), (6, 60), (7, 130)):
+            self.sess_table.setColumnWidth(col, w)
+        self.sess_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.sess_table.setAlternatingRowColors(True)
         self.sess_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.sess_table.verticalHeader().setVisible(False)
         self.sess_table.itemDoubleClicked.connect(lambda _it: self._open_selected())
         lv.addWidget(self.sess_table, stretch=1)
         self.stack.addWidget(list_page)
@@ -577,20 +581,42 @@ class SessionsTab(QWidget):
     def refresh_list(self) -> None:
         self.sess_table.setRowCount(0)
         for s in db.list_sessions(200):
+            v = session_view.row_view(s)
             r = self.sess_table.rowCount()
             self.sess_table.insertRow(r)
             chk = QTableWidgetItem()
             chk.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
             chk.setCheckState(Qt.Unchecked)
+            # 会话 id 存在 UserRole：列顺序调整/隐藏都不影响取 id
+            chk.setData(Qt.UserRole, int(v["id"]))
             self.sess_table.setItem(r, 0, chk)
-            self.sess_table.setItem(r, 1, QTableWidgetItem(str(s["id"])))
-            self.sess_table.setItem(r, 2, QTableWidgetItem(s.get("device_serial") or "-"))
-            self.sess_table.setItem(r, 3, QTableWidgetItem(s.get("name", "")))
-            self.sess_table.setItem(r, 4, QTableWidgetItem(str(s.get("frames", 0))))
-            self.sess_table.setItem(r, 5, _badge_item(str(s.get("anomalies", 0)),
-                                                      (s.get("anomalies") or 0) == 0))
-            self.sess_table.setItem(r, 6, QTableWidgetItem((s.get("trace_id") or "-")[:16]))
-            self.sess_table.setItem(r, 7, QTableWidgetItem(_fmt(s.get("start_us"))))
+
+            def _cell(text, tip=None, role=None):
+                it = QTableWidgetItem(text)
+                it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+                if tip:
+                    it.setToolTip(tip)
+                if role:
+                    it.setData(Qt.UserRole, role)
+                return it
+
+            self.sess_table.setItem(r, 1, _cell(
+                v["label"], (s.get("source_path") or "")))
+            self.sess_table.setItem(r, 2, _cell(
+                v["kind"], "手机日志=adb 从手机 EGOViewer 搬运；"
+                         "电脑端导出=EGOViewer/SDK 本机导出；分析目录=手工选择的本地目录"))
+            self.sess_table.setItem(r, 3, _cell(
+                v["device"],
+                "解析出的真实设备序列号；未识别表示日志里没有可用于对齐的设备标识"))
+            self.sess_table.setItem(r, 4, _cell(v["state"]))
+            self.sess_table.setItem(r, 5, _cell(
+                v["frames"], "帧数为 0 表示这批日志只做留存，未参与时间戳对齐分析"))
+            anom = _badge_item(v["anomalies"], v["anomalies"] in ("0", "—"))
+            anom.setFlags(anom.flags() & ~Qt.ItemIsEditable)
+            self.sess_table.setItem(r, 6, anom)
+            self.sess_table.setItem(r, 7, _cell(
+                v["trace"], v["trace_full"] or "无 trace_id"))
+            self.sess_table.setItem(r, 8, _cell(v["time"]))
 
     def _select_all(self) -> None:
         for r in range(self.sess_table.rowCount()):
@@ -605,13 +631,7 @@ class SessionsTab(QWidget):
                 it.setCheckState(Qt.Unchecked)
 
     def _delete_selected(self) -> None:
-        ids = []
-        for r in range(self.sess_table.rowCount()):
-            it = self.sess_table.item(r, 0)
-            if it and it.checkState() == Qt.Checked:
-                idit = self.sess_table.item(r, 1)
-                if idit:
-                    ids.append(int(idit.text()))
+        ids = self._checked_ids()
         if not ids:
             QMessageBox.information(self, "提示", "请先勾选要删除的会话")
             return
@@ -629,13 +649,14 @@ class SessionsTab(QWidget):
         QMessageBox.information(self, "完成", f"已删除 {len(ids)} 条会话")
 
     def _checked_ids(self) -> list:
+        """勾选行的会话 id（存在复选框的 UserRole 里，不依赖列索引）。"""
         ids = []
         for r in range(self.sess_table.rowCount()):
             it = self.sess_table.item(r, 0)
             if it and it.checkState() == Qt.Checked:
-                idit = self.sess_table.item(r, 1)
-                if idit:
-                    ids.append(int(idit.text()))
+                sid = it.data(Qt.UserRole)
+                if sid is not None:
+                    ids.append(int(sid))
         return ids
 
     def _compare_selected(self) -> None:
@@ -689,8 +710,13 @@ class SessionsTab(QWidget):
         row = self.sess_table.currentRow()
         if row < 0:
             return
-        sid = int(self.sess_table.item(row, 1).text())
-        self.open_session(sid)
+        it = self.sess_table.item(row, 0)
+        if not it:
+            return
+        sid = it.data(Qt.UserRole)
+        if sid is None:
+            return
+        self.open_session(int(sid))
 
     def open_session(self, session_id: int) -> None:
         self._detail.load_session(session_id)

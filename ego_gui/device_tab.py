@@ -15,8 +15,10 @@ import os
 import threading
 import time
 from datetime import datetime
+from typing import Dict
 
 from PySide6.QtCore import Qt, QThread, Signal, QSettings, QPoint, QRect, QEvent, QDateTime, QTime, QTimer
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QPushButton, QFileDialog,
     QLineEdit, QLabel, QGroupBox,
@@ -327,22 +329,26 @@ def _pull_firmware_from_device(fw_root, at, sdk_root, orbbec_sdk, config,
 class EgoOneClickExportWorker(QThread):
     progress = Signal(int)              # 0..100
     status = Signal(str)                # 文本行（写入底部日志框）
-    done = Signal(str, object, str)     # export_dir, session_id(可能 None), report_path(可能 "")
+    done = Signal(str, object, str, object)  # export_dir, session_id, report_path, 手机分组汇总
     cancelled = Signal()                # 用户取消（非失败）
     failed = Signal(str)
 
     def __init__(self, root, out_dir, keys, stage_kwargs=None,
                  auto_import=False, auto_report=False,
-                 device_host="", sdk_port=None):
+                 device_host="", sdk_port=None, mobile_serials=None):
         super().__init__()
         self.root, self.out_dir, self.keys = root, out_dir, keys
         self.stage_kwargs = dict(stage_kwargs or {})
         self.auto_import = auto_import
         self.auto_report = auto_report
+        # 手机日志与固件日志并列参与同一次导出；None/空表示不碰手机。
+        self.mobile_serials = list(mobile_serials or [])
         # 固件日志只有一条来源：Orbbec SDK 固件日志回调（与 EGOViewer「导出日志」一致）。
         self.device_host = device_host
         self.sdk_port = sdk_port
         self.cancel_event = threading.Event()
+        self.mobile_summary = None
+        self._pc_firmware = None
 
     def cancel(self):
         self.cancel_event.set()
@@ -387,37 +393,81 @@ class EgoOneClickExportWorker(QThread):
     def run(self):
         from ego_relay import (orbbec_sdk, export as export_mod, db, config,
                                sftp_pull)
+        from ego_relay import mobile_adb as mobile_adb_mod
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         export_dir = os.path.join(self.out_dir, f"EGO_export_{ts}")
         try:
-            self.status.emit(f"识别 EGOViewer 根目录：{self.root}")
+            if any(k not in ("firmware", "mobile") for k in self.keys):
+                self.status.emit(f"识别 EGOViewer 根目录：{self.root}")
             os.makedirs(export_dir, exist_ok=True)
             collected = {}
+            # 固件日志只导一份：勾了手机日志时，固件日志由手机（Wi-Fi 连设备）提供，
+            # 不再从电脑 USB 重复拉一遍；只有没勾手机日志时才走 Orbbec SDK 直连拉取。
+            mobile_covers_firmware = "mobile" in self.keys and bool(self.mobile_serials)
             # firmware 先拉：失败要尽早中止，不要先把本机日志复制一遍再报错。
             #   所有已连接设备都拉，按设备名分类落盘：
             #   <导出目录>/firmware/<设备名>/<拉取时刻>/orbbec_2026-10-14.log
-            if "firmware" in self.keys:
+            if "firmware" in self.keys and not mobile_covers_firmware:
                 if self._want_cancel():
                     raise evlog_pack.OperationCancelled("操作已取消")
                 pull_at = time.time()
-                fw_root = os.path.join(export_dir, "firmware")
+                fw_root = os.path.join(export_dir, mobile_adb_mod.PC_DIR, "firmware")
                 fw_items = self._pull_firmware(fw_root, pull_at, orbbec_sdk, config)
                 if fw_items:
                     collected["firmware"] = [
                         {"abs": p, "rel": rel, "from_name": True}
                         for p, rel in fw_items]
+                    # 记下每台设备的文件数，供 manifest.txt 说明来源
+                    per_dev: Dict[str, int] = {}
+                    for _p, rel in fw_items:
+                        per_dev[rel.split("/")[0]] = per_dev.get(rel.split("/")[0], 0) + 1
+                    self._pc_firmware = {"at": pull_at, "devices": per_dev}
+            elif "firmware" in self.keys and mobile_covers_firmware:
+                self.status.emit(
+                    "已勾选手机日志：固件日志取自手机导出（mobile/<机型>/firmware_logs/），"
+                    "跳过电脑 USB 直连拉取")
             # app/sdk：从本机 EGOViewer 根目录收集（进度 0–50），按当前筛选方式应用时间/手动筛选
-            app_sdk = [k for k in self.keys if k != "firmware"]
+            app_sdk = [k for k in self.keys if k not in ("firmware", "mobile")]
             if app_sdk:
                 self.status.emit("收集 app/SDK 日志…")
                 _staged, c = evlog_pack.stage(
-                    self.root, export_dir, app_sdk,
+                    self.root, os.path.join(export_dir, mobile_adb_mod.PC_DIR), app_sdk,
                     progress_cb=lambda pct: self.progress.emit(int(pct * 0.5)),
                     should_cancel=self._want_cancel,
                     **self.stage_kwargs)
                 collected.update(c)
+            # 手机日志：与固件日志同一次导出，落到 <导出目录>/mobile/<机型>/，原样搬运
+            if "mobile" in self.keys and self.mobile_serials:
+                if self._want_cancel():
+                    raise evlog_pack.OperationCancelled("操作已取消")
+                self.status.emit("拉取手机日志（adb）…")
+                from ego_relay import mobile_adb
+                adb = mobile_adb.find_adb()
+                if not adb:
+                    raise RuntimeError(
+                        "未找到 adb，请安装 Android platform-tools 并加入 PATH")
+                n_ph = len(self.mobile_serials)
+                for i, serial in enumerate(self.mobile_serials):
+                    self.status.emit(f"[{i + 1}/{n_ph}] 拉取手机 {serial} 的日志…")
+                    base = 50 + i * 45 // max(n_ph, 1)
+                    mobile_adb.pull_all(
+                        adb, serial, export_dir,
+                        note=self.status.emit,
+                        progress=lambda pct, b=base: self.progress.emit(
+                            int(b + pct * 0.45 / max(n_ph, 1))),
+                        cancel_event=self.cancel_event)
+                self.mobile_summary = mobile_adb.summarize(export_dir)
+                n_mob = sum(len(b.get("devices") or [])
+                            for ph in self.mobile_summary.get("phones", [])
+                            for b in ph.get("bundles", []))
+                self.status.emit(f"手机日志：{n_mob} 个设备分组")
             n = sum(len(v) for v in collected.values())
-            if n == 0:
+            has_mobile = bool(
+                self.mobile_summary and any(
+                    b.get("devices") or b.get("app_files")
+                    for ph in self.mobile_summary.get("phones", [])
+                    for b in ph.get("bundles", [])))
+            if n == 0 and not has_mobile:
                 # 区分"没有日志"与"被时间段筛掉了"：后者多发生在默认时间段不含旧日志时，
                 # 提示用户放宽时间段，而不是误报为安装目录有问题。
                 s, e = self.stage_kwargs.get("start"), self.stage_kwargs.get("end")
@@ -428,7 +478,26 @@ class EgoOneClickExportWorker(QThread):
                         f"在所选时间段（{_f(s)} ～ {_f(e)}）内未找到任何日志。"
                         "请把「时间段」放宽（起点可往前调），或改用「手动勾选文件」。")
                 raise RuntimeError("按所选分类未找到任何日志，请检查 EGOViewer 安装目录")
-            self.status.emit(f"已导出 {n} 个日志文件到：{export_dir}")
+            self.status.emit(
+                f"已导出 {n} 个电脑端日志文件"
+                + ("（另含手机日志）" if has_mobile else "")
+                + f"到：{export_dir}")
+            # 来源清单写在导入之前：即使后续分析失败，产物目录里也留有来源说明
+            try:
+                from ego_relay import export_manifest
+                mp = export_manifest.write_manifest(
+                    export_dir, keys=list(self.keys),
+                    export_ts=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    pc_firmware=self._pc_firmware,
+                    mobile=self.mobile_summary,
+                    app_sdk_counts={k: len(v) for k, v in collected.items()
+                                    if k in ("app", "sdk")},
+                    sdk_root=self.root if any(
+                        k in ("app", "sdk") for k in self.keys) else "")
+                self.status.emit(f"已生成来源清单：{os.path.basename(mp)}")
+            except Exception as e:  # noqa: BLE001
+                # 清单是说明性产物，写失败不该让整次导出报废
+                self.status.emit(f"[警告] 来源清单生成失败（不影响日志导出）：{e}")
 
             sid, report_path = None, ""
             has_analysis = bool(collected.get("app") or collected.get("firmware"))
@@ -454,7 +523,7 @@ class EgoOneClickExportWorker(QThread):
             elif self.auto_import and not has_analysis:
                 self.status.emit("所选日志不含可分析来源（app/固件），跳过导入")
             self.progress.emit(100)
-            self.done.emit(export_dir, sid, report_path)
+            self.done.emit(export_dir, sid, report_path, self.mobile_summary)
         except evlog_pack.OperationCancelled:
             self.status.emit("一键导出已取消")
             self.cancelled.emit()
@@ -768,10 +837,30 @@ class ClickableDateTimeEdit(QWidget):
 
 
 # ---------------------------------------------------------------------------
-# 页面
+# 手机 EGOViewer 日志导出：adb 把手机上的导出包原样搬到电脑，不做帧对齐、不改结构
+#   产物：<输出目录>/EGO_export_<时间戳>/mobile/<机型>/{app-logs-zips,sdk-logs,firmware_logs}/
+#   设备分组由手机 App 自己的包结构保证（firmware/<SN>-<时间戳>/），这里只清点并展示。
 # ---------------------------------------------------------------------------
+class MobileScanWorker(QThread):
+    """后台枚举 adb 设备，避免 adb 启动慢时卡住界面。"""
+    result = Signal(list, list)   # ready devices, all entries（含未授权）
+
+    def run(self):
+        from ego_relay import mobile_adb
+        try:
+            adb = mobile_adb.find_adb()
+            if not adb:
+                self.result.emit([], [{"serial": "-", "state": "no-adb"}])
+                return
+            self.result.emit(mobile_adb.list_devices(adb), mobile_adb.device_status(adb))
+        except Exception:  # noqa: BLE001
+            self.result.emit([], [])
+
+
 class DeviceTab(QWidget):
     imported = Signal(int)   # 拉取并导入成功后发出 session_id（供会话记录页刷新）
+    # 未勾选「EGOViewer 手机日志」时下拉框里的提示语
+    _MOBILE_IDLE_TEXT = "勾选左侧「EGOViewer 手机日志」后自动扫描手机"
 
     def __init__(self, log, log_box=None):
         super().__init__()
@@ -783,6 +872,9 @@ class DeviceTab(QWidget):
         self._dp_worker: DeviceExportWorker | None = None  # 远端一键导出
         self._export_worker: EgoOneClickExportWorker | None = None  # EGOviewer 一键导出（SDK 拉固件）
         self._pack_worker: EvLogPackWorker | None = None  # 本地勾选打包
+        self._mobile_scan: MobileScanWorker | None = None
+        self._mobile_devices = []     # [{serial,model}]
+        self._mobile_scan_ok = False  # 本页是否已成功扫到过手机（避免重复扫描）
         self._manual_selection: dict | None = None  # 手动勾选：{分类key: [绝对路径,...]}
         self._devices = []            # [{name,address}]
         self._selected_address = ""
@@ -911,18 +1003,34 @@ class DeviceTab(QWidget):
         rhl_w = QWidget(); rhl_w.setLayout(rhl)
         v.addWidget(rhl_w, 1, 1, 1, 5)
 
-        # --- app 日志（远程 SSH 拉取，默认不勾选） ---
-        v.addWidget(self._field_label("app 日志"), 2, 0)
-        self.chk_app = QCheckBox("SSH/SFTP 拉取")
-        self.chk_app.setChecked(False)
-        self.edit_app_dir = QLineEdit("/ego/logs/app")
-        self.edit_app_dir.setToolTip("设备端 app 日志目录，多个目录用 & 分隔")
-        self.chk_app.toggled.connect(self._sync_ssh_enabled)
-        ah = QHBoxLayout()
-        ah.addWidget(self.chk_app)
-        ah.addWidget(self.edit_app_dir, 1)
-        ah_w = QWidget(); ah_w.setLayout(ah)
-        v.addWidget(ah_w, 2, 1, 1, 5)
+        # --- 手机日志（adb 拉取，勾选后参与「开始一键导出」；不勾则不碰手机） ---
+        v.addWidget(self._field_label("手机日志"), 2, 0)
+        self.chk_mobile = QCheckBox("EGOViewer 手机日志")
+        self.chk_mobile.setToolTip(
+            "勾选后导出手机 EGOViewer 的 App 日志 + 设备固件日志（adb 通道）")
+        self.chk_mobile.setChecked(False)
+        self.chk_mobile.toggled.connect(self._sync_mobile_enabled)
+        self.cmb_mobile = QComboBox()
+        self.cmb_mobile.setToolTip("USB 连接并授权「USB 调试」的手机；勾选后自动扫描")
+        self.cmb_mobile.setMinimumWidth(260)
+        # 未勾选时下拉框保持可用（禁用会被 Qt 改成浅灰白文字，盖掉提示色），
+        # 改为拦截按下事件：不弹列表，只提示先去勾选。
+        self.cmb_mobile.installEventFilter(self)
+        self.lbl_mobile_state = QLabel()
+        self.lbl_mobile_state.setStyleSheet("color:#6b7280;")
+        self._set_mobile_idle()
+        # 与下方「日志类型」卡片同样的灰底 + 内边距，保证两个勾选框左边缘对齐
+        # （卡片内还有一层 logTypeCard 的 12px 内边距，这里用左间距补齐）
+        mgray = QFrame()
+        mgray.setObjectName("logTypeRow")
+        mgray.setAttribute(Qt.WA_StyledBackground, True)
+        mh = QHBoxLayout(mgray)
+        mh.setContentsMargins(10 + 12, 8, 10, 8)
+        mh.setSpacing(10)
+        mh.addWidget(self.chk_mobile)
+        mh.addWidget(self.cmb_mobile, 1)
+        mh.addWidget(self.lbl_mobile_state)
+        v.addWidget(mgray, 2, 1, 1, 5)
 
         # --- 本地日志分类（合并为「日志类型」一行；来源路径/数量进 Tooltip） ---
         self._pack_checks = {}
@@ -955,6 +1063,7 @@ class DeviceTab(QWidget):
         gray_w = QWidget(); gray_w.setLayout(gl)
         v.addWidget(gray_w, r, 1, 1, 5)
         r += 1
+
 
         # --- 筛选方式：与整张表单对齐，左侧字段标签 + 右侧下拉/时间段同一行，切换自动显隐 ---
         # 时间段默认当天（起=今天 00:00，止=当前时刻），需要之前日期可自行选择，无需勾选。
@@ -1090,9 +1199,74 @@ class DeviceTab(QWidget):
         v.setColumnStretch(1, 1)
         v.setColumnStretch(3, 1)
         v.setColumnStretch(5, 1)
-        # 初始同步 SSH 凭证可用状态（默认未勾选 app 日志 → 置灰）
-        self._sync_ssh_enabled(self.chk_app.isChecked())
+        # 初始同步手机日志可用状态（默认未勾选 → 置灰）
+        self._sync_mobile_enabled(self.chk_mobile.isChecked())
         return gb
+
+    def _phone_label(self, d) -> str:
+        """机型名转成好看的显示名：adb 的 ro.product.model 常带下划线（Pixel_7）。"""
+        model = (d.get("model") or "Android").replace("_", " ")
+        return f"{model} · {d['serial']}"
+
+    def _scan_mobile(self):
+        """扫描 adb 手机，结果填进「EGOViewer 手机日志」行的下拉框。
+
+        没有单独的扫描按钮：勾选即扫描。已扫到手机时再次勾选不重复扫，
+        免得每次改勾选都多等一次 adb 枚举。
+        """
+        if self._mobile_scan and self._mobile_scan.isRunning():
+            return
+        if self._mobile_scan_ok:
+            return
+        self.lbl_mobile_state.setText("扫描中…")
+        self.log("扫描 adb 手机设备…")
+        self._mobile_scan = MobileScanWorker()
+        self._mobile_scan.result.connect(self._on_mobile_scan)
+        self._mobile_scan.start()
+
+    def _on_mobile_scan(self, ready, all_entries):
+        prev = self.cmb_mobile.currentData()
+        self._clear_mobile_hint()
+        self.cmb_mobile.blockSignals(True)
+        self.cmb_mobile.clear()
+        self._mobile_devices = ready
+        for d in ready:
+            self.cmb_mobile.addItem(self._phone_label(d), d["serial"])
+        if prev:
+            idx = self.cmb_mobile.findData(prev)
+            if idx >= 0:
+                self.cmb_mobile.setCurrentIndex(idx)
+        self.cmb_mobile.blockSignals(False)
+        self._mobile_scan_ok = bool(ready)
+        if ready:
+            self.lbl_mobile_state.setText(f"{len(ready)} 台已连接")
+            self.log(f"找到 {len(ready)} 台已授权手机")
+            return
+        states = {e.get("state") for e in all_entries or []}
+        if "unauthorized" in states:
+            tip = "已连接未授权，请在手机上点「允许 USB 调试」"
+        elif "no-adb" in states:
+            tip = "未找到 adb，请安装 platform-tools"
+        else:
+            tip = "未找到手机，请 USB 连接并开启调试"
+        self.cmb_mobile.addItem(tip)
+        self.cmb_mobile.setStyleSheet("QComboBox { color:#6b7280; }")
+        self.lbl_mobile_state.setText("")
+        self.log(tip)
+
+    def eventFilter(self, obj, event):
+        """未勾选「EGOViewer 手机日志」时，点下拉框不弹列表，只提醒先勾选。"""
+        if obj is getattr(self, "cmb_mobile", None) and \
+                event.type() in (QEvent.MouseButtonPress, QEvent.Wheel):
+            if not self.chk_mobile.isChecked():
+                self.log("请先勾选左侧「EGOViewer 手机日志」，勾选后会自动扫描手机")
+                return True
+        return super().eventFilter(obj, event)
+
+    def _mobile_serials(self):
+        """当前要导出的手机序列号；下拉框里的提示项没有 UserData，天然被排除。"""
+        cur = self.cmb_mobile.currentData()
+        return [cur] if cur else []
 
     def _build_pack_card(self, cat):
         """构建单个日志类型行内条目：勾选框 + 日志名称 + 状态标签。
@@ -1106,10 +1280,50 @@ class DeviceTab(QWidget):
         chk.setToolTip(tip)   # 仅复选框带 Tooltip，数量标签不弹提示
         return chk, cnt
 
-    def _sync_ssh_enabled(self, checked):
-        """勾选「app 日志(SSH/SFTP 拉取)」时才启用 SSH 凭证输入，避免误填。"""
-        for w in (self.edit_ip, self.edit_user, self.edit_pwd_ssh):
-            w.setEnabled(checked)
+    def _sync_mobile_enabled(self, checked):
+        """勾选「EGOViewer 手机日志」才允许操作下拉框并自动扫描；未勾选时给灰色提示语。
+
+        注意：不用 setEnabled(False)——下拉框被禁用后 Qt 会套用禁用调色板，
+        把 item 的前景色覆盖成浅灰白（#c4c4c4），提示词就不是我们要的灰色了。
+        这里保持控件可用，只禁用弹出与滚动，让提示语按设定颜色渲染。
+        """
+        if checked:
+            self.cmb_mobile.setEnabled(True)
+            # 勾选即扫描；已扫到手机则直接刷新显示，不重复枚举
+            if self._mobile_devices:
+                self._show_mobile_devices()
+            else:
+                self._clear_mobile_hint()
+                self.cmb_mobile.clear()
+                self.cmb_mobile.addItem("正在扫描手机…")
+                self._scan_mobile()
+        else:
+            self.cmb_mobile.setEnabled(True)
+            self._set_mobile_idle()
+
+    def _set_mobile_idle(self):
+        """未勾选时下拉框显示灰色提示语，样式与 BLE 扫描状态文字一致。
+
+        item 的 foreground 在 QSS 下拉框里会被覆盖，所以直接给控件设内联样式；
+        选中设备后由 _clear_mobile_hint 还原成默认颜色。
+        """
+        self.cmb_mobile.clear()
+        self.cmb_mobile.addItem(self._MOBILE_IDLE_TEXT)
+        self.cmb_mobile.setStyleSheet("QComboBox { color:#6b7280; }")
+        self.lbl_mobile_state.setText("")
+
+    def _clear_mobile_hint(self):
+        self.cmb_mobile.setStyleSheet("")
+
+    def _show_mobile_devices(self):
+        """把已扫到的手机填回下拉框（取消勾选再勾回来时用，避免重复扫描）。"""
+        self._clear_mobile_hint()
+        self.cmb_mobile.blockSignals(True)
+        self.cmb_mobile.clear()
+        for d in self._mobile_devices:
+            self.cmb_mobile.addItem(self._phone_label(d), d["serial"])
+        self.cmb_mobile.blockSignals(False)
+        self.lbl_mobile_state.setText(f"{len(self._mobile_devices)} 台已连接")
 
     # ------------------------------------------------------------- BLE
     def _auto_scan_on_popup(self):
@@ -1276,7 +1490,13 @@ class DeviceTab(QWidget):
             self.edit_local.setText(d)
 
     def _start_export(self):
-        """开始一键导出：识别 EGOViewer 根目录 → 全新时间戳目录收集所选日志 → 导入分析 + 报告。"""
+        """开始一键导出：EGOViewer 本地日志 + 设备固件日志 + 手机日志，统一收集到同一时间戳目录。
+
+        三类来源共用一次点击，勾选什么导什么：
+        - 日志类型里的 app/sdk：本机 EGOViewer 目录
+        - 日志类型里的 firmware：Orbbec SDK 从设备实时拉取
+        - 手机日志：adb 拉取手机 EGOViewer 导出包
+        """
         if self._export_worker and self._export_worker.isRunning():
             QMessageBox.information(self, "提示", "已有导出任务进行中")
             return
@@ -1286,16 +1506,30 @@ class DeviceTab(QWidget):
         if self._dp_worker and self._dp_worker.isRunning():
             QMessageBox.information(self, "提示", "已有 SSH 拉取任务进行中")
             return
-        root = self._current_ev_root()
-        if not root or not os.path.isdir(root):
-            QMessageBox.warning(self, "提示", "请先选择有效的 EGOViewer 安装根目录")
-            return
         keys = [k for k, chk in self._pack_checks.items() if chk.isChecked()]
+        want_mobile = self.chk_mobile.isChecked()
+        mobile_serials = []
+        if want_mobile:
+            mobile_serials = self._mobile_serials()
+            if not mobile_serials:
+                QMessageBox.warning(
+                    self, "提示",
+                    "已勾选「手机日志」但没有可用手机。\n请先点「扫描手机」，"
+                    "确认手机已 USB 连接并允许 USB 调试。")
+                return
+            keys.append("mobile")
         if not keys:
             QMessageBox.warning(self, "提示", "请至少勾选一种日志")
             return
+        # 只勾手机日志时不需要 EGOViewer 根目录；其余分类才需要
+        root = self._current_ev_root()
+        needs_root = any(k != "mobile" for k in keys)
+        if needs_root and (not root or not os.path.isdir(root)):
+            QMessageBox.warning(self, "提示", "请先选择有效的 EGOViewer 安装根目录")
+            return
         filters = self._current_filters()
-        if self.cmb_filter.currentData() == "manual" and not (self._manual_selection or {}):
+        if (self.cmb_filter.currentData() == "manual"
+                and needs_root and not (self._manual_selection or {})):
             QMessageBox.warning(self, "提示", "请先点击「选择日志文件…」勾选要导出的日志")
             return
         out_dir = self.edit_local.text().strip() or str(relay_config.EXPORT_DIR)
@@ -1309,13 +1543,17 @@ class DeviceTab(QWidget):
         self.btn_export.setEnabled(False)
         self.btn_pack.setEnabled(False)
         self.btn_stop.setEnabled(True)
-        self.log(f"开始一键导出：{root} → {out_dir}（勾选 {'/'.join(keys)}）")
+        desc = "/".join(keys)
+        if mobile_serials:
+            desc += f"（手机 {len(mobile_serials)} 台）"
+        self.log(f"开始一键导出：{root or '(仅手机)'} → {out_dir}（勾选 {desc}）")
         self._export_worker = EgoOneClickExportWorker(
-            root, out_dir, keys,
+            root or "", out_dir, keys,
             stage_kwargs=filters,
             auto_import=self.chk_import.isChecked(),
             auto_report=self.chk_report.isChecked(),
-            device_host=self.edit_ip.text().strip())
+            device_host=self.edit_ip.text().strip(),
+            mobile_serials=mobile_serials)
         self._export_worker.progress.connect(self.progress.setValue)
         self._export_worker.status.connect(self._append)
         self._export_worker.done.connect(self._on_export_done)
@@ -1324,7 +1562,7 @@ class DeviceTab(QWidget):
         self._export_worker.finished.connect(self._on_export_finished)
         self._export_worker.start()
 
-    def _on_export_done(self, export_dir, sid, report_path):
+    def _on_export_done(self, export_dir, sid, report_path, mobile_summary=None):
         if sid:
             self._append(f"完成：会话 #{sid} 已入库")
             self.log(f"一键导出并导入成功: 会话 #{sid}")
@@ -1333,6 +1571,16 @@ class DeviceTab(QWidget):
             self._append("导出完成，但未产生可分析会话")
         if report_path:
             self._append(f"报告已生成：{report_path}")
+        # 手机日志的分组只能从目录结构看出，导出后在日志里列一遍，免得用户再去找
+        mob_lines = []
+        for ph in (mobile_summary or {}).get("phones", []):
+            for b in ph.get("bundles", []):
+                for dev in b.get("devices") or []:
+                    mob_lines.append(f"  {ph['phone']} / {dev['group']}（{dev['files']} 个文件）")
+        if mob_lines:
+            self._append("手机日志设备分组：")
+            for line in mob_lines:
+                self._append(line)
         ret = QMessageBox.question(
             self, "导出完成",
             f"已导出日志到：\n{export_dir}\n"
