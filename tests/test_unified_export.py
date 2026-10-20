@@ -24,7 +24,7 @@ from ego_gui.device_tab import EgoOneClickExportWorker  # noqa: E402
 
 def _fake_pull_all(adb, serial, dest_root, note=None, progress=None, cancel_event=None):
     """模拟 adb pull：按手机真实结构写出 app-logs-zips / sdk-logs / firmware_logs。"""
-    phone = os.path.join(dest_root, "手机端", "Pixel 7")
+    phone = os.path.join(dest_root, "Pixel 7")
     os.makedirs(phone)
     with zipfile.ZipFile(os.path.join(phone, "手机导出包.zip"), "w") as z:
         z.writestr("app/ego-viewer-2026-10-20.log", "x")
@@ -93,7 +93,7 @@ class TestUnifiedExport(unittest.TestCase):
         export_dir, _sid, _report, summary = done[0]
         self.assertTrue(export_dir.startswith(out))
         # 目录里没有 firmware/，固件日志只在 mobile/ 下
-        self.assertEqual(sorted(os.listdir(export_dir)), ["manifest.txt", "手机端"])
+        self.assertEqual(sorted(os.listdir(export_dir)), ["Pixel 7"])
         groups = [d["group"] for ph in summary["phones"]
                   for b in ph["bundles"] for d in b["devices"]]
         self.assertEqual(groups, ["SNX-20261020_100206_680-aaa"] * 2)
@@ -105,13 +105,13 @@ class TestUnifiedExport(unittest.TestCase):
         out, done, fail = self._run(["firmware"], mobile_serials=[])
         self.assertFalse(fail, f"不应失败：{fail}")
         export_dir = done[0][0]
-        self.assertEqual(sorted(os.listdir(export_dir)), ["manifest.txt", "电脑端"])
+        self.assertEqual(sorted(os.listdir(export_dir)), ["firmware"])
 
     def test_mobile_only_needs_no_ego_viewer_root(self):
         out, done, fail = self._run(["mobile"], mobile_serials=["SN123"])
         self.assertFalse(fail, f"只勾手机不应要求 EGOViewer 根目录：{fail}")
         export_dir = done[0][0]
-        self.assertEqual(sorted(os.listdir(export_dir)), ["manifest.txt", "手机端"])
+        self.assertEqual(sorted(os.listdir(export_dir)), ["Pixel 7"])
 
     def test_mobile_skipped_when_no_serial(self):
         out, done, fail = self._run(["mobile"], mobile_serials=[])

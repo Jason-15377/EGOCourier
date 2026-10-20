@@ -51,17 +51,12 @@ tab._export_worker.finished.connect(loop2.quit)
 QTimer.singleShot(180000, loop2.quit)
 loop2.exec()
 
-from ego_relay import mobile_adb
-mobile_dir = None
-for dirpath, dirs, files in os.walk(out):
-    if os.path.basename(dirpath) == mobile_adb.PHONE_DIR:
-        mobile_dir = dirpath
-        break
-assert mobile_dir, f"导出目录下没有 {mobile_adb.PHONE_DIR}/：{out}"
-phone_dirs = os.listdir(mobile_dir)
-print("手机端:", phone_dirs)
-assert phone_dirs, "手机端/ 下没有手机目录"
-dev = os.path.join(mobile_dir, phone_dirs[0])
+exp = [d for d in os.listdir(out) if d.startswith("EGO_export_")]
+root = os.path.join(out, exp[0]) if exp else out
+phone_dirs = [d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))]
+print("导出目录顶层:", sorted(os.listdir(root)))
+assert phone_dirs, "导出目录下没有手机目录"
+dev = os.path.join(root, phone_dirs[0])
 for name in ("手机导出包.zip", "sdk日志", "固件日志"):
     p = os.path.join(dev, name)
     if os.path.isfile(p):

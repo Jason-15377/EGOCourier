@@ -348,7 +348,6 @@ class EgoOneClickExportWorker(QThread):
         self.sdk_port = sdk_port
         self.cancel_event = threading.Event()
         self.mobile_summary = None
-        self._pc_firmware = None
 
     def cancel(self):
         self.cancel_event.set()
@@ -411,27 +410,22 @@ class EgoOneClickExportWorker(QThread):
                 if self._want_cancel():
                     raise evlog_pack.OperationCancelled("操作已取消")
                 pull_at = time.time()
-                fw_root = os.path.join(export_dir, mobile_adb_mod.PC_DIR, "firmware")
+                fw_root = os.path.join(export_dir, "firmware")
                 fw_items = self._pull_firmware(fw_root, pull_at, orbbec_sdk, config)
                 if fw_items:
                     collected["firmware"] = [
                         {"abs": p, "rel": rel, "from_name": True}
                         for p, rel in fw_items]
-                    # 记下每台设备的文件数，供 manifest.txt 说明来源
-                    per_dev: Dict[str, int] = {}
-                    for _p, rel in fw_items:
-                        per_dev[rel.split("/")[0]] = per_dev.get(rel.split("/")[0], 0) + 1
-                    self._pc_firmware = {"at": pull_at, "devices": per_dev}
             elif "firmware" in self.keys and mobile_covers_firmware:
                 self.status.emit(
-                    "已勾选手机日志：固件日志取自手机导出（mobile/<机型>/firmware_logs/），"
+                    "已勾选手机日志：固件日志取自手机导出（<机型>/固件日志/），"
                     "跳过电脑 USB 直连拉取")
             # app/sdk：从本机 EGOViewer 根目录收集（进度 0–50），按当前筛选方式应用时间/手动筛选
             app_sdk = [k for k in self.keys if k not in ("firmware", "mobile")]
             if app_sdk:
                 self.status.emit("收集 app/SDK 日志…")
                 _staged, c = evlog_pack.stage(
-                    self.root, os.path.join(export_dir, mobile_adb_mod.PC_DIR), app_sdk,
+                    self.root, export_dir, app_sdk,
                     progress_cb=lambda pct: self.progress.emit(int(pct * 0.5)),
                     should_cancel=self._want_cancel,
                     **self.stage_kwargs)
@@ -482,23 +476,6 @@ class EgoOneClickExportWorker(QThread):
                 f"已导出 {n} 个电脑端日志文件"
                 + ("（另含手机日志）" if has_mobile else "")
                 + f"到：{export_dir}")
-            # 来源清单写在导入之前：即使后续分析失败，产物目录里也留有来源说明
-            try:
-                from ego_relay import export_manifest
-                mp = export_manifest.write_manifest(
-                    export_dir, keys=list(self.keys),
-                    export_ts=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    pc_firmware=self._pc_firmware,
-                    mobile=self.mobile_summary,
-                    app_sdk_counts={k: len(v) for k, v in collected.items()
-                                    if k in ("app", "sdk")},
-                    sdk_root=self.root if any(
-                        k in ("app", "sdk") for k in self.keys) else "")
-                self.status.emit(f"已生成来源清单：{os.path.basename(mp)}")
-            except Exception as e:  # noqa: BLE001
-                # 清单是说明性产物，写失败不该让整次导出报废
-                self.status.emit(f"[警告] 来源清单生成失败（不影响日志导出）：{e}")
-
             sid, report_path = None, ""
             has_analysis = bool(collected.get("app") or collected.get("firmware"))
             if self.auto_import and has_analysis:

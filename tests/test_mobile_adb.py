@@ -30,8 +30,7 @@ def _make_bundle(path, devices=("OBC168DEFAULT-20261014_172339_892-71e10790",),
 class TestSummarize(unittest.TestCase):
     def test_groups_by_device_and_counts_app_files(self):
         with tempfile.TemporaryDirectory() as d:
-            _make_bundle(os.path.join(
-                d, "手机端", "Pixel 7", "最新导出包.zip"))
+            _make_bundle(os.path.join(d, "Pixel 7", "最新导出包.zip"))
             res = mobile_adb.summarize(d)
             self.assertEqual(len(res["phones"]), 1)
             phone = res["phones"][0]
@@ -45,7 +44,7 @@ class TestSummarize(unittest.TestCase):
     def test_multi_device_bundle_reports_every_group(self):
         with tempfile.TemporaryDirectory() as d:
             _make_bundle(
-                os.path.join(d, "手机端", "Pixel 7", "最新导出包.zip"),
+                os.path.join(d, "Pixel 7", "最新导出包.zip"),
                 devices=("SNA-20261014_172339_892-aaa",
                          "SNB-20261014_172339_892-bbb"))
             res = mobile_adb.summarize(d)
@@ -56,14 +55,14 @@ class TestSummarize(unittest.TestCase):
     def test_bundle_without_device_logs(self):
         with tempfile.TemporaryDirectory() as d:
             _make_bundle(
-                os.path.join(d, "手机端", "Pixel 7", "最新导出包.zip"),
+                os.path.join(d, "Pixel 7", "最新导出包.zip"),
                 devices=())
             res = mobile_adb.summarize(d)
             self.assertEqual(res["phones"][0]["bundles"][0]["devices"], [])
 
     def test_broken_zip_reported_not_raised(self):
         with tempfile.TemporaryDirectory() as d:
-            zp = os.path.join(d, "手机端", "Pixel 7", "坏包.zip")
+            zp = os.path.join(d, "Pixel 7", "坏包.zip")
             os.makedirs(os.path.dirname(zp))
             with open(zp, "wb") as fh:
                 fh.write(b"not a zip")
@@ -92,7 +91,7 @@ class TestFirmwareGroupNaming(unittest.TestCase):
 
     def test_persisted_bundle_groups_by_real_device(self):
         with tempfile.TemporaryDirectory() as d:
-            zp = os.path.join(d, "手机端", "Pixel 7", "persisted包.zip")
+            zp = os.path.join(d, "Pixel 7", "persisted包.zip")
             os.makedirs(os.path.dirname(zp))
             with zipfile.ZipFile(zp, "w") as z:
                 z.writestr("app/ego-viewer-2026-10-20.log", "x")
@@ -104,11 +103,30 @@ class TestFirmwareGroupNaming(unittest.TestCase):
                                      "files": 3}])
 
 
+class TestFlatLayout(unittest.TestCase):
+    """平铺结构下，电脑端的 app/sdk/firmware 与手机目录同级，不能互相误认。"""
+
+    def test_pc_dirs_ignored_by_summarize(self):
+        with tempfile.TemporaryDirectory() as d:
+            for name in ("app", "sdk", "firmware"):
+                os.makedirs(os.path.join(d, name))
+                open(os.path.join(d, name, "x.log"), "w").write("x")
+            self.assertEqual(mobile_adb.summarize(d), {"phones": []})
+
+    def test_phone_dir_detected_alongside_pc_dirs(self):
+        with tempfile.TemporaryDirectory() as d:
+            for name in ("app", "sdk", "firmware"):
+                os.makedirs(os.path.join(d, name))
+            _make_bundle(os.path.join(d, "Pixel 7", "最新导出包.zip"))
+            res = mobile_adb.summarize(d)
+            self.assertEqual([p["phone"] for p in res["phones"]], ["Pixel 7"])
+
+
 class TestFirmwareLogsSource(unittest.TestCase):
     """firmware_logs/<SN>-<时间戳>/ 是 zip 读不到时唯一可靠的固件日志副本。"""
 
     def _mk_fw(self, root, group, n_files=4):
-        d = os.path.join(root, "手机端", "Pixel 7", "固件日志", group)
+        d = os.path.join(root, "Pixel 7", "固件日志", group)
         os.makedirs(os.path.join(d, "app"))
         os.makedirs(os.path.join(d, "sdk"))
         with open(os.path.join(d, "orbbec_2026-10-19.log"), "w") as fh:
@@ -136,7 +154,7 @@ class TestFirmwareLogsSource(unittest.TestCase):
     def test_both_sources_listed_separately(self):
         with tempfile.TemporaryDirectory() as d:
             self._mk_fw(d, "SNA-20261014_172339_892-aaa")
-            _make_bundle(os.path.join(d, "手机端", "Pixel 7", "最新导出包.zip"),
+            _make_bundle(os.path.join(d, "Pixel 7", "最新导出包.zip"),
                          devices=("SNB-20261014_172339_892-bbb",))
             res = mobile_adb.summarize(d)
             bundles = res["phones"][0]["bundles"]
@@ -148,7 +166,7 @@ class TestFirmwareLogsSource(unittest.TestCase):
 
     def test_empty_firmware_logs_dir_adds_nothing(self):
         with tempfile.TemporaryDirectory() as d:
-            os.makedirs(os.path.join(d, "手机端", "Pixel 7", "固件日志"))
+            os.makedirs(os.path.join(d, "Pixel 7", "固件日志"))
             res = mobile_adb.summarize(d)
             self.assertEqual(res["phones"][0]["bundles"], [])
 

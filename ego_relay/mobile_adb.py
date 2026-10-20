@@ -35,9 +35,8 @@ REMOTE_DIRS = {
     "firmware_logs": f"{REMOTE_FILES}/firmware_logs",
 }
 
-# 导出目录里的两大类：开发拿到导出包先看这一层就能分清哪侧出的日志
-PC_DIR = "电脑端"
-PHONE_DIR = "手机端"
+# 手机日志在导出目录里的落地位置：直接放在 <导出目录>/<机型>/，
+# 与电脑端的 app/ sdk/ firmware/ 平级，不再多套一层来源分类。
 
 # 安卓 data 目录在部分系统/机型上 adb 读不到（Android 11+ 对 /sdcard/Android/data
 # 的限制因厂商而异），给出可执行的替代办法而不是一句“失败”。
@@ -142,7 +141,7 @@ def pull_all(adb: str, serial: str, dest_root: str,
     # 目录名不能带下划线（adb pull 会当成路径分隔符），所以 Pixel_7 → Pixel 7；
     # 日志里则用同样可读的显示名。
     label = _folder_name(model, serial)
-    dev_root = os.path.join(dest_root, PHONE_DIR, label)
+    dev_root = os.path.join(dest_root, label)
     result: Dict[str, list] = {}
 
     # 1) 最新导出包：按文件名里的时间戳挑最新，避免依赖 mtime（拷来拷去会变）
@@ -332,13 +331,20 @@ def summarize(dest_root: str) -> Dict[str, object]:
     返回 {"phones": [{"phone", "bundles": [{"source", "zip"|"dir",
     "devices":[{group,files}], "app_files"}]}]}；只读，不改动任何文件。
     """
-    root = os.path.join(dest_root, PHONE_DIR)
+    root = dest_root
     phones = []
     if not os.path.isdir(root):
         return {"phones": phones}
+    # 平铺结构下电脑端的 app/ sdk/ firmware/ 与本函数的手机目录同级，
+    # 只认带手机产物特征的目录（有导出包或固件日志），其余跳过。
+    pc_dirs = {"app", "sdk", "firmware"}
     for phone in sorted(os.listdir(root)):
         phone_dir = os.path.join(root, phone)
-        if not os.path.isdir(phone_dir):
+        if not os.path.isdir(phone_dir) or phone in pc_dirs:
+            continue
+        has_zip = bool(glob.glob(os.path.join(phone_dir, "*.zip")))
+        has_fw = os.path.isdir(os.path.join(phone_dir, "固件日志"))
+        if not (has_zip or has_fw):
             continue
         bundles = []
 
