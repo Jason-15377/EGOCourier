@@ -1352,10 +1352,24 @@ class DeviceTab(QWidget):
         self._set_ble_state("扫描失败")
         self._append(f"[错误] 蓝牙扫描失败: {msg}")
         self.log(f"蓝牙扫描失败: {msg}")
+        text = str(msg)
+        low = text.lower()
+        if "egolowble.dll" in low and ("未找到" in text or "not found" in low):
+            hint = ("便携版自带 lib\\EgoLowBle.dll，正常不应出现此问题。请确认：\n"
+                    "1) 解压完整，不是只拷贝了 exe 单个文件；\n"
+                    "2) 解压路径没有被杀毒软件拦掉 runtime\\lib\\EgoLowBle.dll；\n"
+                    "3) 也可把 EGOViewer 安装目录下的 EgoLowBle.dll 放到 exe 同级的 lib\\ 下。")
+        elif "egolowble.dll" in low:
+            hint = ("DLL 已找到但加载失败：常见原因是位数不匹配（需 64 位）"
+                    "或缺少 VC++ 运行库。可安装 Microsoft Visual C++ "
+                    "Redistributable (x64) 后重试。")
+        elif "蓝牙" in text or "bluetooth" in low:
+            hint = "请确认这台电脑有蓝牙适配器且已开启；台式机常需要外接 USB 蓝牙模块。"
+        else:
+            hint = ""
         QMessageBox.warning(
             self, "扫描失败",
-            f"蓝牙扫描失败：{msg}\n\n若提示 EgoLowBle.dll 相关，说明 ABI 尚未与真机校准，"
-            "拿到 EgoLowBle.h 头文件后即可修复。")
+            f"蓝牙扫描失败：{msg}" + (f"\n\n{hint}" if hint else ""))
 
     def _on_dev_pick(self, dev):
         if not dev:

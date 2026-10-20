@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import sys
 from ctypes import POINTER, c_char_p, c_int, c_void_p, c_size_t, c_uint8, c_uint16, c_int16
 
 from . import config
@@ -189,27 +190,61 @@ def _find_in_dir(root: str) -> str:
 
 
 def find_dll(explicit: str = "") -> str:
-    """按优先级定位 EgoLowBle.dll，找不到返回空串。"""
+    """按优先级定位 EgoLowBle.dll，找不到返回空串。
+
+    打包成 exe 后 `__file__` 位于 PyInstaller 的解包目录（`sys._MEIPASS`），
+    而 DLL 由 spec 放进该目录下的 `lib/`，所以必须优先查 `_MEIPASS`——
+    否则算出来的「项目根」是解包目录的父级，永远找不到随包携带的那份。
+    """
     candidates = []
     if explicit:
         candidates.append(explicit)
     if config.EGOLOWBLE_DLL:
         candidates.append(config.EGOLOWBLE_DLL)
     candidates.append(os.environ.get("EGOLOWBLE_DLL", ""))
-    here = os.path.dirname(os.path.abspath(__file__))          # ego_relay/
-    project = os.path.dirname(here)                            # 项目根
-    candidates.append(os.path.join(project, "lib", "EgoLowBle.dll"))
-    candidates.append(os.path.join(here, "EgoLowBle.dll"))
-    for probe in (project, os.path.join(project, ".."),
-                  r"D:\Soft&tools\软件工具", r"D:\Soft&tools", r"D:\file"):
+
+    meipass = getattr(sys, "_MEIPASS", "")
+    here = os.path.dirname(os.path.abspath(__file__))          # 源码: ego_relay/；打包: <MEIPASS>
+    project = os.path.dirname(here)                            # 源码: 项目根；打包: 解包目录的上一级
+    probes = [p for p in (meipass, project, here) if p]
+    for root in probes:
+        candidates.append(os.path.join(root, "lib", "EgoLowBle.dll"))
+        candidates.append(os.path.join(root, "EgoLowBle.dll"))
+    # 便携版另有一份可执行文件旁的 lib/（用户自行补放 DLL 时用）
+    if getattr(sys, "frozen", False):
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        candidates.append(os.path.join(exe_dir, "lib", "EgoLowBle.dll"))
+        probes.append(exe_dir)
+
+    # 没装 EGOViewer 的机器上，退回到「已安装的 EGOViewer」常见位置：
+    # 便携版解压目录、程序目录、以及各盘符根下的工具目录都在探测范围内。
+    for probe in probes:
         found = _find_in_dir(probe)
         if found:
             candidates.append(found)
+    for drive in _candidate_drives():
+        for rel in ("EGOViewer",), ("Soft&tools", "软件工具"):
+            base = os.path.join(drive + os.sep, *rel)
+            if os.path.isdir(base):
+                found = _find_in_dir(base)
+                if found:
+                    candidates.append(found)
 
     for c in candidates:
         if c and os.path.isfile(c):
             return os.path.abspath(c)
     return ""
+
+
+def _candidate_drives() -> list:
+    """本机存在的盘符（用于找已安装的 EGOViewer，不写死某台机器的路径）。"""
+    if os.name != "nt":
+        return []
+    drives = []
+    for letter in "CDEFGH":
+        if os.path.isdir(f"{letter}:\\"):
+            drives.append(letter + ":")
+    return drives
 
 
 # ---------------------------------------------------------------------------

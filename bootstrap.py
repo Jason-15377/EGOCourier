@@ -38,7 +38,7 @@ LOG_DIR = os.path.join(HERE, "log")
 RUN_LOG = os.path.join(LOG_DIR, "launcher.log")
 PIP_TIMEOUT_S = 60 * 45          # 全新安装 PySide6+matplotlib 约 200MB，慢网要留足
 PIP_MIRROR = os.environ.get("EGO_PIP_INDEX_URL", "").strip()  # 内网镜像可选
-APP_VERSION = "1.0.4"
+APP_VERSION = "1.0.5"
 
 if HERE not in sys.path:
     sys.path.insert(0, HERE)

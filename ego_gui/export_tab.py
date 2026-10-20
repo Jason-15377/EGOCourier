@@ -26,7 +26,9 @@ class BleScanWorker(QThread):
         try:
             from ego_relay import ble_provision
             if not ble_provision.dll_available():
-                self.failed.emit("未找到 EgoLowBle.dll，请先安装 EGOViewer")
+                self.failed.emit(
+                    "未找到 EgoLowBle.dll。便携版应自带 lib\\EgoLowBle.dll——"
+                    "请确认解压完整（不是只拷了 exe），或安装 EGOViewer 后重试。")
                 return
             self.result.emit(ble_provision.scan_devices())
         except Exception as e:  # noqa: BLE001
