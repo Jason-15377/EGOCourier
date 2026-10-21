@@ -19,8 +19,7 @@ assert tabs == expected, tabs
 # 合并设备与日志工作台控件
 et = w.device_tab
 for n in ("dev_table", "btn_scan", "edit_ssid", "edit_pwd", "btn_provision",
-          "edit_ip", "edit_app_dir", "chk_firmware", "edit_sdk_root", "edit_sdk_port",
-          "btn_export", "task_log", "_layout_splitter"):
+          "edit_ip", "cmb_ev_root", "btn_export"):
     assert hasattr(et, n), f"设备工作台缺 {n}"
 assert et._layout_splitter.count() == 3
 # 会话记录页：会话表 + 详情

@@ -303,9 +303,8 @@ class EvLogPackWorker(QThread):
 _FIRMWARE_ERR_HINTS = {
     "dll":
         "未找到 OrbbecSDK.dll。\n"
-        "请在「② 设备实时拉取」里指定「SDK 根目录」"
-        "（EGOViewer 安装包自带该 DLL），\n"
-        "或先修复「EGOViewer 根目录」的自动识别。",
+        "该 DLL 由 EGOViewer 自带，位于其安装目录下。请确认"
+        "「EGOViewer 根目录」选中的是本机安装目录（含 EGOViewer.exe 的那一层）。",
     "no_device":
         "Orbbec SDK 没有枚举到任何设备。\n"
         "请检查：\n"
@@ -453,7 +452,7 @@ class EgoOneClickExportWorker(QThread):
         # 固件日志只有一条来源：Orbbec SDK 固件日志回调（与 EGOViewer「导出日志」一致）。
         self.device_host = device_host
         self.sdk_port = sdk_port
-        # 界面上「SDK 根目录」的取值；留空则由 SDK 层自动探测。
+        # SDK 根目录：直接沿用已选中的 EGOViewer 根目录（DLL 随 EGOViewer 安装）。
         self.sdk_root = sdk_root
         self.cancel_event = threading.Event()
         self.mobile_summary = None
@@ -1090,26 +1089,8 @@ class DeviceTab(QWidget):
         rhl_w = QWidget(); rhl_w.setLayout(rhl)
         v.addWidget(rhl_w, 1, 1, 1, 5)
 
-        # --- Orbbec SDK 根目录（含 OrbbecSDK.dll 的目录；留空自动探测） ---
-        v.addWidget(self._field_label("SDK 根目录"), 2, 0)
-        shl = QHBoxLayout()
-        self.edit_sdk_root = QLineEdit()
-        self.edit_sdk_root.setPlaceholderText(
-            "留空自动探测（优先使用 EGOViewer 自带的 OrbbecSDK.dll）")
-        self.edit_sdk_root.setToolTip(
-            "包含 OrbbecSDK.dll 的目录。留空时依次尝试：环境变量 ORBBEC_SDK_ROOT → "
-            "本工具 runtime/lib → EGOViewer 安装目录。")
-        if relay_config.ORBBEC_SDK_ROOT:
-            self.edit_sdk_root.setText(relay_config.ORBBEC_SDK_ROOT)
-        shl.addWidget(self.edit_sdk_root, 1)
-        btn_sdk = QPushButton("浏览…")
-        btn_sdk.clicked.connect(self._pick_sdk_root)
-        shl.addWidget(btn_sdk)
-        shl_w = QWidget(); shl_w.setLayout(shl)
-        v.addWidget(shl_w, 2, 1, 1, 5)
-
         # --- 手机日志（adb 拉取，勾选后参与「开始一键导出」；不勾则不碰手机） ---
-        v.addWidget(self._field_label("手机日志"), 3, 0)
+        v.addWidget(self._field_label("手机日志"), 2, 0)
         self.chk_mobile = QCheckBox("EGOViewer 手机日志")
         self.chk_mobile.setToolTip(
             "勾选后导出手机 EGOViewer 的 App 日志 + 设备固件日志（adb 通道）")
@@ -1135,13 +1116,13 @@ class DeviceTab(QWidget):
         mh.addWidget(self.chk_mobile)
         mh.addWidget(self.cmb_mobile, 1)
         mh.addWidget(self.lbl_mobile_state)
-        v.addWidget(mgray, 3, 1, 1, 5)
+        v.addWidget(mgray, 2, 1, 1, 5)
 
         # --- 本地日志分类（合并为「日志类型」一行；来源路径/数量进 Tooltip） ---
         self._pack_checks = {}
         self._pack_counts = {}
         self._pack_sources = {}
-        r = 4
+        r = 3
         v.addWidget(self._field_label("日志类型"), r, 0)
         # 灰底容器，内部每个日志选项一张白色圆角容器，横向分隔
         gray = QFrame()
@@ -1710,9 +1691,9 @@ class DeviceTab(QWidget):
             QMessageBox.warning(
                 self, "未找到 Orbbec SDK",
                 "已勾选「设备固件日志」，但未找到 OrbbecSDK.dll。\n\n"
-                "请在上方「SDK 根目录」中指定包含 OrbbecSDK.dll 的目录，"
-                "或确认「EGOViewer 根目录」已正确识别"
-                "（EGOViewer 安装包自带该 DLL）。")
+                "OrbbecSDK.dll 由 EGOViewer 自带，位于其安装目录下。\n"
+                "请确认上方「EGOViewer 根目录」选中的是本机的 EGOViewer 安装目录"
+                "（含 EGOViewer.exe 的那一层），可点「浏览…」手动指定。")
             return False
         self.log(f"Orbbec SDK: {dll}")
 
@@ -1865,15 +1846,15 @@ class DeviceTab(QWidget):
             self.cmb_ev_root.setCurrentIndex(idx)
             self._update_pack_counts()
 
-    def _pick_sdk_root(self):
-        d = QFileDialog.getExistingDirectory(
-            self, "选择 Orbbec SDK 根目录（含 OrbbecSDK.dll）")
-        if d:
-            self.edit_sdk_root.setText(d)
-
     def _current_sdk_root(self) -> str:
-        """当前生效的 SDK 根目录：输入框优先，留空则由 SDK 层自动探测。"""
-        return self.edit_sdk_root.text().strip() if hasattr(self, "edit_sdk_root") else ""
+        """SDK 根目录直接取自「EGOViewer 根目录」。
+
+        OrbbecSDK.dll 就装在 EGOViewer 安装目录下，单独再让用户指一次 SDK 路径是
+        重复输入、也容易让人以为是两个东西。这里以已选中的 EGOViewer 根目录为准，
+        没选中时返回空串，由 SDK 层继续按常规流程自动探测。
+        """
+        root = self._current_ev_root()
+        return root if root and os.path.isdir(root) else ""
 
     def _current_ev_root(self):
         return self.cmb_ev_root.currentData() or self.cmb_ev_root.currentText()

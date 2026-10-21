@@ -71,9 +71,8 @@ EXAMPLE_DEVICE_PORT = 8090   # Orbbec SDK 网络设备端口；SSH 端口仍由 
 
 # Orbbec SDK firmware-log export. The SDK package can be selected here or via
 # ORBBEC_SDK_ROOT; an empty value uses the bundled/default discovery locations.
-# 留空：由 SDK 层自动探测（显式参数 → 本项 → 环境变量 → 本工具 runtime/lib →
-# EGOViewer 安装目录，EGOViewer 安装包自带 OrbbecSDK.dll）。界面「SDK 根目录」
-# 输入框填写后以界面值为准。
+# 留空即可：OrbbecSDK.dll 随 EGOViewer 安装，界面选好「EGOViewer 根目录」就会从
+# 该目录取 DLL。无界面调用（CLI/Web）时才需要设这里或环境变量 ORBBEC_SDK_ROOT。
 ORBBEC_SDK_ROOT = ""
 ORBBEC_SDK_PORT = 8090
 

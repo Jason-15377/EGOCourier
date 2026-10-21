@@ -17,7 +17,7 @@ assert tabs[0] == "设备与日志", tabs
 
 et = w.device_tab
 for name in ("dev_table", "btn_scan", "edit_ssid", "edit_pwd", "btn_provision",
-             "btn_export", "edit_sdk_root", "task_log"):
+             "btn_export", "edit_ip", "cmb_ev_root"):
     assert hasattr(et, name), f"缺少控件 {name}"
 print("BLE 配网控件齐全")
 

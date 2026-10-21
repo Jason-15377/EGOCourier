@@ -363,7 +363,7 @@ def list_devices(sdk_root: str = "") -> list[dict]:
     """
     dll = find_sdk_dll(sdk_root)
     if not dll:
-        raise OrbbecSdkError("未找到 OrbbecSDK.dll，请在「SDK 根目录」中指定或确认已安装 EGOViewer", kind="dll")
+        raise OrbbecSdkError("未找到 OrbbecSDK.dll。该 DLL 由 EGOViewer 自带，请确认已安装 EGOViewer", kind="dll")
     b = _SdkBindings(dll)
     ctx = device_list = None
     try:
@@ -562,7 +562,7 @@ def export_firmware_logs(output_dir: str, sdk_root: str = "", device_index: int 
     """
     dll = find_sdk_dll(sdk_root)
     if not dll:
-        raise OrbbecSdkError("未找到 OrbbecSDK.dll，请在「SDK 根目录」中指定或确认已安装 EGOViewer", kind="dll")
+        raise OrbbecSdkError("未找到 OrbbecSDK.dll。该 DLL 由 EGOViewer 自带，请确认已安装 EGOViewer", kind="dll")
     b = _SdkBindings(dll)
     ctx = device_list = device = None
     callback_ref = None
