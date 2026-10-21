@@ -42,29 +42,38 @@ for _p in (EXPORT_DIR, IMPORT_TMP):
 # EGOViewer 应用日志的本地时区相对 UTC 偏移（小时）。示例日志为 UTC+8。
 VIEWER_TZ_HOURS = 8
 
-# 搜索本机 EGOViewer 安装目录的根路径（找到形如 EGOViewer_*_win_x64 且含 data/logs 的目录）。
-EGO_VIEWER_SEARCH_ROOTS = [r"D:\Soft&tools\软件工具", r"D:\Soft&tools", r"D:\file"]
+# 搜索本机 EGOViewer 安装目录的**额外**根路径。默认留空：
+# 真正的搜索根由 evlog_pack._candidate_search_roots() 动态推导——
+#   1) 环境变量 EGO_VIEWER_ROOT（精确指定，优先级最高）；
+#   2) 本列表里用户/现场补充的目录；
+#   3) 本工具所在盘符、其上一级目录、以及各常见安装盘的一级子目录。
+# 注意：不要把某台开发机上的绝对路径写死在这里，换机器就失效（v1.0.5 之前的坑）。
+EGO_VIEWER_SEARCH_ROOTS = []
 
 
 # ---------------------------------------------------------------------------
 # 设备连接信息（SSH 远程拉取待拿到真实凭证后再启用）
 # 本地导入模式不需要以下三个参数。
-#   设备 IP：从 EGOViewer 设备详情 / 路由器 / TTL 串口 ifconfig 获取
+#   设备 IP：从 BLE 配网结果 / EGOViewer 设备详情 / 路由器 / TTL 串口 ifconfig 获取
 #   SSH 用户名/密码：需用户手动输入（暂未知）
 # ---------------------------------------------------------------------------
-DEVICE_IP = "10.9.82.9"  # 最近一次 BLE 配网拿到的设备 IP；可在界面修改
+# 留空：IP 由配网结果自动回填，或由用户在现场填写。写死某个测试网段的地址会在
+# 别的网络环境下误导用户（曾预填 10.9.82.9，而实际设备在 192.168.1.x）。
+DEVICE_IP = ""
 SSH_USER = ""             # 需用户手动输入
 SSH_PASSWORD = ""         # 需用户手动输入
 SSH_PORT = 22
 
 # 测试设备示例（用户提供）：wifi=TP-LINK_AC2600_5G  ip=192.168.1.118:8090
-EXAMPLE_DEVICE_IP = "10.9.82.9"
+# 同样留空，避免预填一个本机不存在的地址。
+EXAMPLE_DEVICE_IP = ""
 EXAMPLE_DEVICE_PORT = 8090   # Orbbec SDK 网络设备端口；SSH 端口仍由 SSH_PORT 控制
 
 # Orbbec SDK firmware-log export. The SDK package can be selected here or via
 # ORBBEC_SDK_ROOT; an empty value uses the bundled/default discovery locations.
-# 留空：不在界面预填 SDK 路径，由用户在「设备与日志」页手动填写本机 SDK 根目录
-# （含 bin\\OrbbecSDK.dll 的目录）。
+# 留空：由 SDK 层自动探测（显式参数 → 本项 → 环境变量 → 本工具 runtime/lib →
+# EGOViewer 安装目录，EGOViewer 安装包自带 OrbbecSDK.dll）。界面「SDK 根目录」
+# 输入框填写后以界面值为准。
 ORBBEC_SDK_ROOT = ""
 ORBBEC_SDK_PORT = 8090
 

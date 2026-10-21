@@ -4,14 +4,15 @@
 保留原始文件名），以日期时间命名，保存到自定义路径。原始日志文件一律不改动。
 
 三类日志（相对 EGOViewer 安装根目录的常见位置）：
-  app      → data\\logs\\EGOViewer_*.log          EGOViewer 应用运行/操作日志
+  app      → Log\\EGOViewer_*.log（v2.0.17+）/ data\\logs\\EGOViewer_*.log（旧版）
   sdk      → Log\\OrbbecSDK.*.log.txt              Orbbec SDK 在 PC 上运行的底层日志
   firmware → data\\firmware-logs\\**\\orbbec*.log   相机设备端固件日志（按拉取时间戳分子目录）
 
 版本兼容：candidate_rel_dirs 是各分类的“常见”相对路径；若这些目录都不存在或
 没找到文件，则回退为在整个安装根目录下按文件名模式递归搜索，以适配未来版本
-目录结构调整。是否某目录是 EGOViewer 安装根目录，以存在 EGOViewer.exe（或
-data/logs）为稳定判据。
+目录结构调整。是否某目录是 EGOViewer 安装根目录，以 is_ego_viewer_root() 的
+内容判据为准（EGOViewer.exe / Log 下的 EGOViewer_*.log / 数据目录），不依赖
+目录名里的版本号或 data/logs。
 
 可取消：collect/stage/pack_staged/discover 均接受可选 should_cancel 回调（默认
 不可取消）。回调在收集、复制、压缩的长循环检查点被调用，返回真则抛
@@ -52,9 +53,13 @@ CATEGORIES = [
         "key": "app",
         "label": "EGOViewer 应用日志",
         "zip_dir": "app",
-        "candidate_rel_dirs": ["data/logs"],
+        # v2.0.17 起应用日志写在 Log/，旧版本在 data/logs。按顺序找，命中即用。
+        "candidate_rel_dirs": ["Log", "logs", "data/logs"],
         "pattern": "EGOViewer_*.log",
         "recursive": False,
+        # 回退模式必须显式包含 EGOViewer_*.log：data/logs 不存在时，_gather 的整根
+        # 递归只按这份模式捞文件，漏掉它就会"根目录对、app 日志却 0 个"。
+        "fallback_patterns": ["EGOViewer_*.log", "ego-viewer-*.log"],
         "desc": "EGOViewer 应用运行/操作日志（设备扫描、配网、连接、码流、参数等）",
     },
     {
@@ -72,8 +77,10 @@ CATEGORIES = [
         "zip_dir": "firmware",
         "candidate_rel_dirs": ["data/firmware-logs", "firmware-logs"],
         "pattern": "*",
-        # 回退模式需覆盖设备侧三类固件日志（orbbec.log + messages.log* +
-        # observice.console.log*），避免目录结构变动后漏收。
+        "patterns": ["orbbec*.log*", "messages.log*", "observice.console.log*"],
+        # 设备侧固件日志的实际文件名：orbbec*.log* / messages.log* /
+        # observice.console.log*。历史上这里用了 "*"，会把 .lock、dmesg.txt、
+        # device_status.txt 等非日志产物一起收进来，包体变大且干扰分析。
         "fallback_pattern": "orbbec*.log*",
         "fallback_patterns": ["orbbec*.log*", "messages.log*", "observice.console.log*"],
         "recursive": True,
@@ -84,6 +91,17 @@ CATEGORIES = [
 
 def _matches(fn: str, pattern: str) -> bool:
     return pattern == "*" or fnmatch.fnmatch(fn, pattern)
+
+
+def _matches_any(fn: str, cat: dict) -> bool:
+    """文件名是否命中该分类的收集模式。
+
+    cat["patterns"] 优先（一个分类可能对应多种文件名前缀）；否则退回单个 pattern。
+    """
+    pats = cat.get("patterns")
+    if pats:
+        return any(_matches(fn, p) for p in pats)
+    return _matches(fn, cat["pattern"])
 
 
 def _version_key(name: str) -> tuple:
@@ -98,41 +116,211 @@ def _version_key(name: str) -> tuple:
 
 
 def find_ego_viewer_roots() -> list:
-    """在 EGO_VIEWER_SEARCH_ROOTS 下定位 EGOViewer 安装根目录。
+    """定位本机所有 EGOViewer 安装根目录，按版本从新到旧排序。
 
-    判据：目录名以 EGOViewer_ 开头且含 win_x64，且存在 EGOViewer.exe（或 data/logs）。
-    返回结果按版本号从新到旧排序（同一版本内按目录名），保证界面默认选中最新版本。
+    搜索根见 `_candidate_search_roots`：不再依赖写死的路径列表，换盘 / 重装到
+    其它目录 / 换一台机器都能自动发现。
+
+    两种命中方式：
+      1) 父目录下存在子目录，且该子目录满足 is_ego_viewer_root（最常见）；
+      2) 父目录本身就是一个安装根（用户把安装目录直接填进了自定义列表）。
     """
     out = []
-    for root in config.EGO_VIEWER_SEARCH_ROOTS:
-        if not os.path.isdir(root):
+    seen = set()
+
+    def _push(p):
+        key = os.path.normcase(os.path.normpath(p))
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(p)
+
+    for root in _candidate_search_roots():
+        if is_ego_viewer_root(root):
+            _push(root)
             continue
-        try:
-            entries = list(os.scandir(root))
-        except OSError:
-            continue
-        for e in entries:
-            try:
-                if e.is_dir() and e.name.startswith("EGOViewer_") and "win_x64" in e.name:
-                    has_exe = os.path.isfile(os.path.join(e.path, "EGOViewer.exe"))
-                    has_data = os.path.isdir(os.path.join(e.path, "data", "logs"))
-                    if has_exe or has_data:
-                        out.append(e.path)
-            except OSError:
-                continue
+        for depth in (1, 2):
+            for sub in _subdirs(root, depth, _EGO_DIR_PREFIXES):
+                if is_ego_viewer_root(sub):
+                    _push(sub)
+
     out.sort(
         key=lambda p: (_version_key(os.path.basename(p)), os.path.basename(p)),
         reverse=True)
     return out
 
 
-def _gather(root: str, cat: dict, should_cancel=None) -> list:
+def _subdirs(base: str, depth: int, prefixes=()) -> list:
+    """列出 base 下 depth 层内的子目录（depth<=2，只做浅层探测）。
+
+    prefixes 只用于**更深一层**的粗筛（减少无谓的 stat）；第一层全收，
+    否则像 <盘>\\Soft&tools\\软件工具\\EGOViewer_* 这种两层布局会被漏掉。
+    """
+    out = []
+    if depth <= 0:
+        return out
+    try:
+        entries = list(os.scandir(base))
+    except OSError:
+        return out
+    for e in entries:
+        try:
+            if not e.is_dir():
+                continue
+        except OSError:
+            continue
+        out.append(e.path)
+        if depth > 1:
+            try:
+                deeper = list(os.scandir(e.path))
+            except OSError:
+                continue
+            for d in deeper:
+                try:
+                    if not d.is_dir():
+                        continue
+                except OSError:
+                    continue
+                if prefixes and not d.name.lower().startswith(prefixes):
+                    continue
+                out.append(d.path)
+    return out
+
+
+def is_ego_viewer_root(path: str) -> bool:
+    """判断 path 是否为一个可用的 EGOViewer 安装根目录。
+
+    判据是**内容特征**而不是目录名：exe、Log/ 下的 EGOViewer_*.log、或数据目录。
+    v2.0.17 起应用日志写在 Log/ 且没有 data/logs，旧判据（data/logs）已完全失效，
+    因此这里同时接受新旧两种布局。
+    """
+    if not path or not os.path.isdir(path):
+        return False
+    if os.path.isfile(os.path.join(path, "EGOViewer.exe")):
+        return True
+    # 便携版/精简版可能没有 exe：看日志目录里是否有 EGOViewer 的会话日志
+    for probe in ("Log", "logs"):
+        d = os.path.join(path, probe)
+        if not os.path.isdir(d):
+            continue
+        try:
+            if any(fn.startswith("EGOViewer_") and fn.endswith(".log")
+                   for fn in os.listdir(d)):
+                return True
+        except OSError:
+            pass
+    for probe in ("data/firmware-logs", "firmware-logs", "data/recordings"):
+        if os.path.isdir(os.path.join(path, *probe.split("/"))):
+            return True
+    return False
+
+
+# 常见安装盘的一级目录里，EGOViewer 可能被放在这些"工具目录"之下。
+# "软件工具" 这类名字本身不会直接命中 is_ego_viewer_root（里面装的是 EGOViewer_*
+# 子目录），所以它们只作为"再往下一层扫"的入口。
+_COMMON_TOOL_DIRS = ("1_soft", "Software", "Software_Tools", "Soft&tools",
+                     "软件工具", "Program Files", "Program Files (x86)", "Tools")
+
+# 工具目录下一层里，名字以此开头的目录才继续当作扫描根（减少无谓的目录探测）。
+_TOOL_SUBDIR_PREFIXES = ("egoviewer", "orbbec", "ego")
+
+# 浅层查找时用来粗筛目录名：EGOViewer 的安装目录一般都以此开头。
+_EGO_DIR_PREFIXES = ("egoviewer",)
+
+
+def _candidate_search_roots() -> list:
+    """动态推导应当扫描哪些父目录来找 EGOViewer（顺序即优先级）。
+
+    只看父目录的一层子目录，不递归，避免全盘扫描拖慢启动。
+    返回去重后、实际存在的目录列表。
+    """
+    import sys
+
+    raw = []   # 按优先级记录的候选，最后统一去重
+
+    def _add(p):
+        if p:
+            raw.append(p)
+
+    # 1) 环境变量：精确指定本机的安装位置
+    _add(os.environ.get("EGO_VIEWER_ROOT", ""))
+
+    # 2) 配置里的自定义搜索根（用户或现场运维补充）
+    for r in getattr(config, "EGO_VIEWER_SEARCH_ROOTS", []) or []:
+        _add(r)
+
+    # 3) 本工具自己的位置。便携版常见布局是
+    #    <盘>\<某目录>\EGO Courier\ 与 <盘>\<某目录>\EGOViewer_*\ 并列，
+    #    所以 exe 所在目录、上一级目录、盘符根都纳入扫描。
+    if getattr(sys, "frozen", False):
+        base = os.path.dirname(os.path.abspath(sys.executable))
+    else:
+        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    _add(base)
+    _add(os.path.dirname(base))
+    drive = os.path.splitdrive(base)[0]
+    if drive:
+        _add(drive + os.sep)
+
+    # 4) 常见安装盘的一级目录 + 常见工具目录名（及其下一层）。
+    #    实测现场布局是 <盘>\Soft&tools\软件工具\EGOViewer_v2.0.17_...\，
+    #    即安装根藏在"工具目录"的下一层，只扫一级会漏掉，故多探一层。
+    for letter in "CDEFGH":
+        d = f"{letter}:\\"
+        if not os.path.isdir(d):
+            continue
+        _add(d)
+        for sub in _COMMON_TOOL_DIRS:
+            tool = os.path.join(d, sub)
+            if not os.path.isdir(tool):
+                continue
+            _add(tool)
+            try:
+                entries = list(os.scandir(tool))
+            except OSError:
+                continue
+            for e in entries:
+                try:
+                    if e.is_dir() and e.name.lower().startswith(_TOOL_SUBDIR_PREFIXES):
+                        _add(e.path)
+                except OSError:
+                    continue
+
+    # 统一去重（同一目录可能被多条规则命中）后只保留真实存在的目录
+    roots, seen = [], set()
+    for p in raw:
+        try:
+            p = os.path.normpath(p)
+        except (TypeError, ValueError):
+            continue
+        key = os.path.normcase(p)
+        if key in seen or not os.path.isdir(p):
+            continue
+        seen.add(key)
+        roots.append(p)
+    return roots
+
+
+def _gather(root: str, cat: dict, should_cancel=None, claimed=None) -> list:
     """在某安装根目录下收集一个分类的日志文件。
 
-    优先从 candidate_rel_dirs 中首个存在的目录收集；若都为空，则回退为在整个
+    优先从 candidate_rel_dirs 中首个有命中的目录收集；若都为空，则回退为在整个
     根目录下按文件名模式递归搜索（版本兼容）。返回 [{"abs","rel"}]，rel 相对
     cat 的收集基准目录（candidate 目录，或回退时的安装根）。
+
+    claimed：已被前面分类收走的绝对路径集合。app 与 sdk 的日志都在 Log/ 下，
+    app 的旧版回退模式（递归整根）会把 OrbbecSDK.*.log.txt 也算成
+    ego-viewer-* 之外的噪声，因此这里做一次去重，保证一个文件只进一个分类。
     """
+    claimed = claimed if claimed is not None else set()
+
+    def _add(found, full, rel):
+        key = os.path.normcase(os.path.abspath(full))
+        if key in claimed:
+            return
+        claimed.add(key)
+        found.append({"abs": full, "rel": rel})
+
     found = []
     for rel in cat["candidate_rel_dirs"]:
         base = os.path.join(root, rel)
@@ -142,27 +330,28 @@ def _gather(root: str, cat: dict, should_cancel=None) -> list:
             for dirpath, _dirnames, filenames in os.walk(base):
                 _check_cancel(should_cancel)
                 for fn in filenames:
-                    if not _matches(fn, cat["pattern"]):
+                    if not _matches_any(fn, cat):
                         continue
                     full = os.path.join(dirpath, fn)
-                    found.append({"abs": full, "rel": os.path.relpath(full, base)})
+                    _add(found, full, os.path.relpath(full, base))
         else:
             for fn in os.listdir(base):
                 full = os.path.join(base, fn)
-                if os.path.isfile(full) and _matches(fn, cat["pattern"]):
-                    found.append({"abs": full, "rel": fn})
+                if os.path.isfile(full) and _matches_any(fn, cat):
+                    _add(found, full, fn)
         if found:
             break
     if not found:
-        # 回退：整个根目录按模式递归找（firmware 用更精确的回退模式，避免误收非日志文件）
-        pats = cat.get("fallback_patterns") or [cat.get("fallback_pattern", cat["pattern"])]
+        # 回退：整个根目录按模式递归找（用更精确的回退模式，避免误收非日志文件）
+        pats = (cat.get("patterns") or cat.get("fallback_patterns")
+                or [cat.get("fallback_pattern", cat["pattern"])])
         for dirpath, _dirnames, filenames in os.walk(root):
             _check_cancel(should_cancel)
             for fn in filenames:
                 if not any(_matches(fn, p) for p in pats):
                     continue
                 full = os.path.join(dirpath, fn)
-                found.append({"abs": full, "rel": os.path.relpath(full, root)})
+                _add(found, full, os.path.relpath(full, root))
     return found
 
 
@@ -237,13 +426,14 @@ def discover(root: str, keys=None, should_cancel=None) -> dict:
     """
     keys = keys or [c["key"] for c in CATEGORIES]
     result = {}
+    claimed = set()   # 同一个文件只归属一个分类（app 与 sdk 共用 Log/）
     for cat in CATEGORIES:
         _check_cancel(should_cancel)
         key = cat["key"]
         if key not in keys:
             result[key] = []
             continue
-        files = _gather(root, cat, should_cancel)
+        files = _gather(root, cat, should_cancel, claimed=claimed)
         for f in files:
             f["start_stamp"], f["end_stamp"], f["from_name"] = _file_stamp(f["abs"], f["rel"])
             f["stamp"] = f["start_stamp"]

@@ -55,7 +55,7 @@ class WifiScanWorker(QThread):
 # ---------------------------------------------------------------------------
 class DeviceBleProvisionWorker(QThread):
     status = Signal(str)     # 逐步状态
-    done = Signal(str)       # 设备 IP（可能为空串 = 未在超时内拿到）
+    done = Signal(str)       # 设备 IP（只在成功时发出，绝不为空串）
     failed = Signal(str)
 
     def __init__(self, address, ssid, password):
@@ -73,10 +73,14 @@ class DeviceBleProvisionWorker(QThread):
                 if not ble.is_connected():
                     raise egolowble.BleError("连接后 is_connected 返回假，配网前置条件不满足")
                 self.status.emit("下发 Wi-Fi 配置…")
+                # 设备端拒绝配置（密码错误等）时这里直接抛 BleError，
+                # 由下方 except 统一转成 failed，不再"假装在等联网"。
                 ble.configure_wifi(self.ssid, self.password)
-                self.status.emit("已下发，等待设备加入局域网并上报 IP…")
+                self.status.emit("设备已接受配置，等待加入局域网并上报 IP…")
+
                 deadline = time.time() + join_timeout
                 ip = ""
+                elapsed = 0.0
                 while time.time() < deadline:
                     try:
                         ip = ble.get_ip()
@@ -86,9 +90,23 @@ class DeviceBleProvisionWorker(QThread):
                         self.status.emit(f"设备已联网，IP = {ip}")
                         self.done.emit(ip)
                         return
-                    time.sleep(2.0)
-                self.status.emit("等待超时，未拿到设备 IP")
-                self.done.emit("")
+                    # 前 12 秒每秒轮询（设备通常 2~5 秒拿到 IP），之后退避到 3 秒
+                    step = 1.0 if elapsed < 12 else 3.0
+                    time.sleep(step)
+                    elapsed += step
+                    self.status.emit(
+                        f"等待设备联网…已等 {int(elapsed)}/{int(join_timeout)} 秒")
+
+                # 超时是失败，不是"完成但没结果"：必须让界面出红色错误而不是灰字。
+                self.failed.emit(
+                    f"等待设备联网超时（{int(join_timeout)} 秒内未上报 IP）。\n"
+                    "可能原因：\n"
+                    "  · 路由器拒绝了该设备（MAC 地址过滤 / 客户端隔离 / 访客网络）\n"
+                    "  · 该 Wi-Fi 需要 Portal（网页）认证\n"
+                    "  · 设备与路由器距离过远或干扰过强\n"
+                    "建议：\n"
+                    "  1) 在 EGOViewer「设备信息」页确认设备是否已显示 IP；\n"
+                    "  2) 换用手机热点（2.4GHz）重试，可排除路由器策略问题。")
         except Exception as e:  # noqa: BLE001
             self.failed.emit(str(e))
 
@@ -183,7 +201,7 @@ class EvLogPackWorker(QThread):
 
     def __init__(self, root, out_dir, keys, stage_kwargs=None, auto_import=False,
                  auto_report=False, prefix="EGOViewer_logs",
-                 device_host="", sdk_port=None):
+                 device_host="", sdk_port=None, sdk_root=""):
         super().__init__()
         self.root, self.out_dir, self.keys = root, out_dir, keys
         self.stage_kwargs = dict(stage_kwargs or {})
@@ -192,6 +210,7 @@ class EvLogPackWorker(QThread):
         self.prefix = prefix
         self.device_host = device_host
         self.sdk_port = sdk_port
+        self.sdk_root = sdk_root
         self.cancel_event = threading.Event()
 
     def cancel(self):
@@ -217,7 +236,8 @@ class EvLogPackWorker(QThread):
                 fw_root = os.path.join(pull_work, "firmware")
                 puller = EgoOneClickExportWorker(
                     self.root, pull_work, ["firmware"], stage_kwargs=self.stage_kwargs,
-                    device_host=self.device_host, sdk_port=self.sdk_port)
+                    device_host=self.device_host, sdk_port=self.sdk_port,
+                    sdk_root=self.sdk_root)
                 puller.status.connect(self.status.emit)
                 puller.progress.connect(lambda pct: self.progress.emit(int(pct * 0.5)))
                 puller.cancel_event = self.cancel_event
@@ -280,43 +300,130 @@ class EvLogPackWorker(QThread):
             shutil.rmtree(pull_work, ignore_errors=True)
 
 
+_FIRMWARE_ERR_HINTS = {
+    "dll":
+        "未找到 OrbbecSDK.dll。\n"
+        "请在「② 设备实时拉取」里指定「SDK 根目录」"
+        "（EGOViewer 安装包自带该 DLL），\n"
+        "或先修复「EGOViewer 根目录」的自动识别。",
+    "no_device":
+        "Orbbec SDK 没有枚举到任何设备。\n"
+        "请检查：\n"
+        "  1) 设备是否已上电、USB 线是否插好；\n"
+        "  2) 若设备刚配网（只走 Wi-Fi），确认它与本机在同一网段且能 ping 通；\n"
+        "  3) 关闭 EGOViewer 后重试（两者会争抢设备）。",
+    "busy":
+        "设备正被其它程序占用。\n"
+        "最常见的是 EGOViewer 正在使用该设备 —— 请先完全退出 EGOViewer 再重试。",
+    "fw_disabled":
+        "设备端未开启固件日志功能（SDK 报 Firmware log disabled）。\n"
+        "请在 EGOViewer 中连接该设备，确认「设备信息」页的固件日志可正常导出；\n"
+        "若那边也拉不到，需要先在设备侧打开日志开关。",
+    "timeout":
+        "等待设备回传固件日志超时。\n"
+        "可能是日志文件过大或链路不稳定（USB 线接触不良 / Wi-Fi 干扰）。\n"
+        "建议改为单台设备重试，并靠近路由器。",
+    "canceled":
+        "操作已取消。",
+}
+
+
+def _firmware_error_hint(err) -> str:
+    """把 OrbbecSdkError 按 kind 转成面向用户的可操作提示。
+
+    kind 缺失时退回通用文案：至少不要再把"缺 DLL"说成"设备未连接"，
+    那会让用户去查数据线，而真实原因是配置问题。
+    """
+    kind = getattr(err, "kind", "other")
+    head = _FIRMWARE_ERR_HINTS.get(kind)
+    if head:
+        return f"{head}\n\n（原始错误：{err}）"
+    return f"固件日志导出失败：{err}"
+
+
 def _pull_firmware_from_device(fw_root, at, sdk_root, orbbec_sdk, config,
                                status=None, progress=None, cancel_event=None,
-                               device_host="", port=None) -> list:
-    """从**所有已连接设备**各拉一份固件日志到 fw_root，返回 [(路径, 相对rel)]。
+                               device_host="", port=None, prefer_ip="") -> list:
+    """从**所有已连接设备**各拉一份固件日志，返回 [(绝对路径, 相对 rel)]。
 
-    目录结构对齐设备名分类：fw_root/<设备名>/<拉取时刻>/<设备侧原文件名>。
-    与 EGOViewer「导出日志」一致：走 Orbbec SDK 固件日志回调接口。全部设备都失败时
-    抛 RuntimeError 中止导出；部分失败会逐台提示，成功的照常保留。
+    磁盘结构：fw_root/<设备名>/<拉取时刻>/<设备侧原文件名>
+    rel   结构：<设备名>/<拉取时刻>/<文件名>        ← 与磁盘严格一致
+
+    实现要点：SDK 回调只能指定一个输出目录，无法按"设备/时刻"两级组织，因此先拉到
+    _staging，再逐文件 move 到目标位置。这样同时解决"rel 与磁盘不符"和"同一目录
+    重复导出互相覆盖"两个问题，同名同秒的产物再加时间戳后缀兜底。
+
+    device_host / prefer_ip：配网拿到的设备 IP。设备配网后只走网络链路（USB 一插
+    就无法同时建立 Wi-Fi 连接），必须把它传给 SDK，否则纯网络设备会被当成
+    "局域网里别人的设备"静默跳过。
     """
+    import shutil
+
     emit = status or (lambda _t: None)
     prog = progress or (lambda _p: None)
     pull_name = datetime.fromtimestamp(at).strftime("%Y%m%d-%H%M%S")
     emit("通过 Orbbec SDK 从设备实时拉取固件日志（与 EGOViewer「导出日志」一致）…"
          "（保持设备连接）")
+    target_ip = (prefer_ip or device_host or "").strip()
+    if target_ip:
+        emit(f"目标设备 IP：{target_ip}（配网结果，将优先按此 IP 拉取）")
+
+    stage_root = os.path.join(fw_root, "_staging")
+    os.makedirs(stage_root, exist_ok=True)
     try:
         result = orbbec_sdk.export_all_firmware_logs(
-            fw_root, sdk_root=sdk_root,
+            stage_root, sdk_root=sdk_root,
             cancel_event=cancel_event,
             note_cb=emit,
-            progress_cb=lambda pct, name: prog(pct))
+            progress_cb=lambda pct, name: prog(pct),
+            # 有配网 IP 说明设备只走网络链路，此时必须允许网络设备参与
+            include_network=bool(target_ip),
+            prefer_ip=target_ip,
+            prefer_port=int(port or 0))
     except orbbec_sdk.OrbbecSdkError as e:
         if cancel_event is not None and cancel_event.is_set():
             raise evlog_pack.OperationCancelled("操作已取消") from e
-        raise RuntimeError(
-            f"固件日志导出失败，请确认设备已连接、EGOviewer 未占用设备：{e}") from e
+        # 失败时 stage_root 里可能有半成品，一并清掉，避免污染下一次导出
+        shutil.rmtree(stage_root, ignore_errors=True)
+        raise RuntimeError(_firmware_error_hint(e)) from e
+
     out = []
-    for folder, info in result.get("ok", {}).items():
-        for p in info.get("paths", []):
-            out.append((p, f"{folder}/{pull_name}/{os.path.basename(p)}"))
-        emit(f"设备 {folder}：{len(info.get('paths', []))} 个文件")
+    try:
+        for folder, info in result.get("ok", {}).items():
+            dest_dir = os.path.join(fw_root, folder, pull_name)
+            os.makedirs(dest_dir, exist_ok=True)
+            for p in info.get("paths", []):
+                base = os.path.basename(p)
+                dest = os.path.join(dest_dir, base)
+                if os.path.exists(dest):
+                    # 同一秒内重复导出同一设备：加时间戳后缀，绝不覆盖
+                    stem, ext = os.path.splitext(base)
+                    base = f"{stem}_{int(at)}{ext}"
+                    dest = os.path.join(dest_dir, base)
+                shutil.move(p, dest)
+                out.append((dest, f"{folder}/{pull_name}/{base}"))
+            emit(f"设备 {folder}：{len(info.get('paths', []))} 个文件")
+    finally:
+        shutil.rmtree(stage_root, ignore_errors=True)
+
     errors = result.get("errors") or []
     if not out:
-        detail = "；".join(f"{e.get('name') or '未知设备'}: {e.get('error')}" for e in errors)
-        raise RuntimeError("所有设备均未拉取到固件日志" + (f"（{detail}）" if detail else ""))
+        by_kind = {}
+        for e in errors:
+            by_kind.setdefault(e.get("kind", "other"), []).append(
+                str(e.get("name") or "未知设备"))
+        parts = []
+        for kind, names in by_kind.items():
+            head = _FIRMWARE_ERR_HINTS.get(kind, "").splitlines()
+            label = head[0] if head else kind
+            parts.append(f"{label}：{'、'.join(names)}")
+        detail = "；".join(parts)
+        raise RuntimeError(
+            "所有设备均未拉取到固件日志" + (f"（{detail}）" if detail else ""))
     if errors:
         emit(f"有 {len(errors)} 台设备拉取失败，其余设备产物已保留："
-             + "；".join(f"{e.get('name') or '未知设备'}（{e.get('error')}）" for e in errors))
+             + "；".join(f"{e.get('name') or '未知设备'}（{e.get('error')}）"
+                        for e in errors))
     return out
 
 
@@ -335,7 +442,7 @@ class EgoOneClickExportWorker(QThread):
 
     def __init__(self, root, out_dir, keys, stage_kwargs=None,
                  auto_import=False, auto_report=False,
-                 device_host="", sdk_port=None, mobile_serials=None):
+                 device_host="", sdk_port=None, mobile_serials=None, sdk_root=""):
         super().__init__()
         self.root, self.out_dir, self.keys = root, out_dir, keys
         self.stage_kwargs = dict(stage_kwargs or {})
@@ -346,6 +453,8 @@ class EgoOneClickExportWorker(QThread):
         # 固件日志只有一条来源：Orbbec SDK 固件日志回调（与 EGOViewer「导出日志」一致）。
         self.device_host = device_host
         self.sdk_port = sdk_port
+        # 界面上「SDK 根目录」的取值；留空则由 SDK 层自动探测。
+        self.sdk_root = sdk_root
         self.cancel_event = threading.Event()
         self.mobile_summary = None
 
@@ -375,7 +484,7 @@ class EgoOneClickExportWorker(QThread):
                 "（如需包含请调整时间段）")
             return []
         items = _pull_firmware_from_device(
-            fw_root, pull_at, self.root, orbbec_sdk, config,
+            fw_root, pull_at, self.sdk_root, orbbec_sdk, config,
             status=self.status.emit,
             progress=lambda pct: self.progress.emit(50 + int(pct * 0.5)),
             cancel_event=self.cancel_event,
@@ -972,7 +1081,8 @@ class DeviceTab(QWidget):
         rhl.addWidget(self.cmb_ev_root, 1)
         btn_rescan = QPushButton("重新检测")
         btn_rescan.setToolTip("重新扫描常见安装路径下的 EGOViewer 目录")
-        btn_rescan.clicked.connect(self._rescan_ev_roots)
+        # 只有用户主动点击才弹提示；启动时的自动检测保持静默
+        btn_rescan.clicked.connect(lambda: self._rescan_ev_roots(interactive=True))
         btn_browse_root = QPushButton("浏览…")
         btn_browse_root.clicked.connect(self._pick_ev_root)
         rhl.addWidget(btn_rescan)
@@ -980,8 +1090,26 @@ class DeviceTab(QWidget):
         rhl_w = QWidget(); rhl_w.setLayout(rhl)
         v.addWidget(rhl_w, 1, 1, 1, 5)
 
+        # --- Orbbec SDK 根目录（含 OrbbecSDK.dll 的目录；留空自动探测） ---
+        v.addWidget(self._field_label("SDK 根目录"), 2, 0)
+        shl = QHBoxLayout()
+        self.edit_sdk_root = QLineEdit()
+        self.edit_sdk_root.setPlaceholderText(
+            "留空自动探测（优先使用 EGOViewer 自带的 OrbbecSDK.dll）")
+        self.edit_sdk_root.setToolTip(
+            "包含 OrbbecSDK.dll 的目录。留空时依次尝试：环境变量 ORBBEC_SDK_ROOT → "
+            "本工具 runtime/lib → EGOViewer 安装目录。")
+        if relay_config.ORBBEC_SDK_ROOT:
+            self.edit_sdk_root.setText(relay_config.ORBBEC_SDK_ROOT)
+        shl.addWidget(self.edit_sdk_root, 1)
+        btn_sdk = QPushButton("浏览…")
+        btn_sdk.clicked.connect(self._pick_sdk_root)
+        shl.addWidget(btn_sdk)
+        shl_w = QWidget(); shl_w.setLayout(shl)
+        v.addWidget(shl_w, 2, 1, 1, 5)
+
         # --- 手机日志（adb 拉取，勾选后参与「开始一键导出」；不勾则不碰手机） ---
-        v.addWidget(self._field_label("手机日志"), 2, 0)
+        v.addWidget(self._field_label("手机日志"), 3, 0)
         self.chk_mobile = QCheckBox("EGOViewer 手机日志")
         self.chk_mobile.setToolTip(
             "勾选后导出手机 EGOViewer 的 App 日志 + 设备固件日志（adb 通道）")
@@ -1007,13 +1135,13 @@ class DeviceTab(QWidget):
         mh.addWidget(self.chk_mobile)
         mh.addWidget(self.cmb_mobile, 1)
         mh.addWidget(self.lbl_mobile_state)
-        v.addWidget(mgray, 2, 1, 1, 5)
+        v.addWidget(mgray, 3, 1, 1, 5)
 
         # --- 本地日志分类（合并为「日志类型」一行；来源路径/数量进 Tooltip） ---
         self._pack_checks = {}
         self._pack_counts = {}
         self._pack_sources = {}
-        r = 3
+        r = 4
         v.addWidget(self._field_label("日志类型"), r, 0)
         # 灰底容器，内部每个日志选项一张白色圆角容器，横向分隔
         gray = QFrame()
@@ -1363,7 +1491,9 @@ class DeviceTab(QWidget):
             color = "#dc2626"
         elif "成功" in text or "已联网" in text or "ip" in low:
             color = "#16a34a"
-        elif "中" in text:
+        elif "中" in text or "已等" in text:
+            # 进度态（连接中/配网中/等待设备联网…已等 N/40 秒）用蓝色，
+            # 与"空闲/灰字"区分开，用户能看出任务还在跑。
             color = "#2563eb"
         else:
             color = "#6b7280"
@@ -1459,20 +1589,26 @@ class DeviceTab(QWidget):
         self._append(text)
 
     def _on_provision_done(self, ip):
-        if ip:
-            self._set_ble_state(f"已联网 · IP = {ip}")
-            self._append(f"配网成功，设备 IP = {ip}")
-            self.log(f"配网成功: 设备 IP = {ip}")
-            # 自动回填到② 合并分组的设备 IP，方便直接使用
-            self.edit_ip.setText(ip)
-        else:
-            self._set_ble_state("未拿到 IP")
-            self._append("配网已下发，但未在超时内拿到 IP")
+        if not ip:
+            # worker 只在成功时 emit done，空 IP 属于不该发生的情况；按失败处理
+            self._on_provision_fail("配网结束时未拿到设备 IP，请重试")
+            return
+        self._set_ble_state(f"已联网 · IP = {ip}")
+        self._append(f"配网成功，设备 IP = {ip}")
+        self.log(f"配网成功: 设备 IP = {ip}")
+        # 自动回填到② 合并分组的设备 IP，方便直接使用
+        self.edit_ip.setText(ip)
 
     def _on_provision_fail(self, msg):
+        """配网失败：红色状态 + 弹窗。
+
+        以前这里只写一行灰字，用户以为"点错了没反应"——尤其是 Wi-Fi 密码错误时
+        界面既不报错也不提示，只能靠猜。
+        """
         self._set_ble_state("配网失败")
         self._append(f"[错误] 配网失败: {msg}")
         self.log(f"配网失败: {msg}")
+        QMessageBox.critical(self, "配网失败", str(msg))
 
     # ------------------------------------------------------------- 远端一键导出
     def _pick_local(self):
@@ -1529,6 +1665,8 @@ class DeviceTab(QWidget):
         except OSError as e:
             QMessageBox.warning(self, "提示", f"输出目录不可写：{e}")
             return
+        if not self._precheck_firmware(keys):
+            return
 
         self.progress.setValue(0)
         self.btn_export.setEnabled(False)
@@ -1544,6 +1682,8 @@ class DeviceTab(QWidget):
             auto_import=self.chk_import.isChecked(),
             auto_report=self.chk_report.isChecked(),
             device_host=self.edit_ip.text().strip(),
+            sdk_port=relay_config.ORBBEC_SDK_PORT,
+            sdk_root=self._current_sdk_root(),
             mobile_serials=mobile_serials)
         self._export_worker.progress.connect(self.progress.setValue)
         self._export_worker.status.connect(self._append)
@@ -1552,6 +1692,46 @@ class DeviceTab(QWidget):
         self._export_worker.failed.connect(self._on_export_fail)
         self._export_worker.finished.connect(self._on_export_finished)
         self._export_worker.start()
+
+    def _precheck_firmware(self, keys) -> bool:
+        """勾了固件日志时做前置检查，返回 False 表示用户放弃本次导出。
+
+        提前拦住两类问题：找不到 OrbbecSDK.dll（配置问题）、目标设备 ping 不通
+        （网络问题）。否则要等整轮跑完（最长 180 秒）才报一个笼统的"设备未连接"。
+        """
+        if "firmware" not in keys:
+            return True
+        try:
+            from ego_relay import orbbec_sdk
+            dll = orbbec_sdk.find_sdk_dll(self._current_sdk_root())
+        except Exception:  # noqa: BLE001
+            dll = ""
+        if not dll:
+            QMessageBox.warning(
+                self, "未找到 Orbbec SDK",
+                "已勾选「设备固件日志」，但未找到 OrbbecSDK.dll。\n\n"
+                "请在上方「SDK 根目录」中指定包含 OrbbecSDK.dll 的目录，"
+                "或确认「EGOViewer 根目录」已正确识别"
+                "（EGOViewer 安装包自带该 DLL）。")
+            return False
+        self.log(f"Orbbec SDK: {dll}")
+
+        # 固件日志要经网络拉取时，先确认设备真的在线：一次 ping 失败就报
+        # "设备不在线"，比等 180 秒超时有用得多。
+        host = self.edit_ip.text().strip()
+        if not host:
+            return True
+        try:
+            from ego_relay import wifi as wifi_mod
+            alive = wifi_mod.ping(host, timeout_ms=1500)
+        except Exception:  # noqa: BLE001
+            return True    # ping 本身不可用时不要阻断导出
+        if alive:
+            return True
+        return QMessageBox.question(
+            self, "设备可能不在线",
+            f"Ping {host} 不通。\n\n设备固件日志需要能经网络访问该 IP。\n"
+            "是否仍然继续尝试导出？") == QMessageBox.Yes
 
     def _on_export_done(self, export_dir, sid, report_path, mobile_summary=None):
         if sid:
@@ -1623,24 +1803,57 @@ class DeviceTab(QWidget):
         self.btn_pack.setEnabled(True)
         self.btn_stop.setEnabled(False)
 
-    def _rescan_ev_roots(self):
+    def _rescan_ev_roots(self, interactive: bool = False):
+        """重新扫描本机 EGOViewer 安装目录。
+
+        interactive=True 表示用户在界面上主动点了「重新检测」：此时检测不到要弹窗
+        并列出扫描过的位置，否则"点了没反应"等于坏了。__init__ 里调用时保持默认
+        False，启动过程不能弹窗打断用户。
+        """
         try:
             roots = evlog_pack.find_ego_viewer_roots()
         except Exception as e:  # noqa: BLE001
             self._append(f"[错误] 检测 EGOViewer 目录失败: {e}")
             self.log(f"检测 EGOViewer 目录失败: {e}")
             return
+        # 保留用户手动添加过、但本次没扫到的目录：一点「重新检测」就把选择清空
+        # 会让"手动浏览指定"变成一次性操作。
+        manual = []
+        for i in range(self.cmb_ev_root.count()):
+            d = self.cmb_ev_root.itemData(i)
+            if d and d not in roots and os.path.isdir(d):
+                manual.append(d)
+        merged = list(roots) + manual
+
+        prev = self.cmb_ev_root.currentData()
         self.cmb_ev_root.blockSignals(True)
         self.cmb_ev_root.clear()
-        for rt in roots:
+        for rt in merged:
             self.cmb_ev_root.addItem(rt, rt)
-        if roots:
-            self.cmb_ev_root.setCurrentIndex(0)
+        if merged:
+            idx = self.cmb_ev_root.findData(prev) if prev else -1
+            self.cmb_ev_root.setCurrentIndex(idx if idx >= 0 else 0)
         self.cmb_ev_root.blockSignals(False)
         self._update_pack_counts()
-        if not roots:
-            self._append("未自动检测到 EGOViewer 安装目录，可点「浏览…」手动指定")
-            self.log("未自动检测到本机 EGOViewer 安装目录")
+
+        if roots:
+            self.log(f"检测到 {len(roots)} 个 EGOViewer 安装目录：" + "；".join(roots))
+            return
+        self._append("未自动检测到 EGOViewer 安装目录，可点「浏览…」手动指定")
+        self.log("未自动检测到本机 EGOViewer 安装目录")
+        if not interactive:
+            return
+        try:
+            searched = evlog_pack._candidate_search_roots()
+        except Exception:  # noqa: BLE001
+            searched = []
+        shown = "\n  ".join(searched[:12]) + ("\n  …" if len(searched) > 12 else "")
+        QMessageBox.warning(
+            self, "未检测到 EGOViewer",
+            "已在下列位置扫描（含其下两层子目录），均未找到 EGOViewer 安装目录：\n  "
+            + (shown or "（无）")
+            + "\n\n请点「浏览…」选择 EGOViewer 安装根目录（含 EGOViewer.exe 的那一层），"
+              "\n或设置环境变量 EGO_VIEWER_ROOT 指向该目录。")
 
     def _pick_ev_root(self):
         d = QFileDialog.getExistingDirectory(self, "选择 EGOViewer 安装根目录")
@@ -1650,6 +1863,17 @@ class DeviceTab(QWidget):
                 self.cmb_ev_root.addItem(d, d)
                 idx = self.cmb_ev_root.findData(d)
             self.cmb_ev_root.setCurrentIndex(idx)
+            self._update_pack_counts()
+
+    def _pick_sdk_root(self):
+        d = QFileDialog.getExistingDirectory(
+            self, "选择 Orbbec SDK 根目录（含 OrbbecSDK.dll）")
+        if d:
+            self.edit_sdk_root.setText(d)
+
+    def _current_sdk_root(self) -> str:
+        """当前生效的 SDK 根目录：输入框优先，留空则由 SDK 层自动探测。"""
+        return self.edit_sdk_root.text().strip() if hasattr(self, "edit_sdk_root") else ""
 
     def _current_ev_root(self):
         return self.cmb_ev_root.currentData() or self.cmb_ev_root.currentText()
@@ -1865,6 +2089,8 @@ class DeviceTab(QWidget):
         except OSError as e:
             QMessageBox.warning(self, "提示", f"输出目录不可写：{e}")
             return
+        if not self._precheck_firmware(keys):
+            return
 
         self.progress.setValue(0)
         self.btn_pack.setEnabled(False)
@@ -1876,7 +2102,9 @@ class DeviceTab(QWidget):
             stage_kwargs=filters,
             auto_import=self.chk_import.isChecked(),
             auto_report=self.chk_report.isChecked(),
-            device_host=self.edit_ip.text().strip())
+            device_host=self.edit_ip.text().strip(),
+            sdk_port=relay_config.ORBBEC_SDK_PORT,
+            sdk_root=self._current_sdk_root())
         self._pack_worker.progress.connect(self.progress.setValue)
         self._pack_worker.status.connect(self._append)
         self._pack_worker.done.connect(self._on_pack_done)

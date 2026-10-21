@@ -344,7 +344,47 @@ class TestUsbFirstSelection(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp:
                 res = sdk.export_all_firmware_logs(tmp, note_cb=notes.append)
                 self.assertEqual(len(res["skipped"]), 2)
-                self.assertTrue(any("跳过局域网设备" in n for n in notes), notes)
+                # 提示要说明"为什么跳过"，否则用户只会看到设备少了两台
+                self.assertTrue(any("跳过 2 台设备" in n and "非 USB 直连" in n
+                                    for n in notes), notes)
+        finally:
+            sdk.list_devices, sdk.export_firmware_logs = orig_list, orig_single
+
+    def test_prefer_ip_picks_only_that_device(self):
+        """配网后设备只走网络链路：必须能按 IP 精确选中它，而不是被 USB 优先跳过。"""
+        from ego_relay import orbbec_sdk as sdk
+
+        pulled = []
+        orig_list, orig_single = sdk.list_devices, sdk.export_firmware_logs
+        sdk.list_devices = lambda *a, **k: self.DEVICES
+        sdk.export_firmware_logs = lambda out_dir, **kw: (
+            pulled.append((out_dir, kw.get("device_ip"))) or [])
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                res = sdk.export_all_firmware_logs(
+                    tmp, prefer_ip="192.168.1.101")
+                self.assertEqual(len(res["ok"]), 1, res)
+                self.assertEqual(len(pulled), 1)
+                self.assertEqual(pulled[0][1], "192.168.1.101")
+                # 其余设备（含 USB 直连）都算跳过，并说明原因
+                self.assertEqual(len(res["skipped"]), 4)
+        finally:
+            sdk.list_devices, sdk.export_firmware_logs = orig_list, orig_single
+
+    def test_prefer_ip_falls_back_when_not_found(self):
+        """IP 不在枚举列表里（例如刚断电）时回退到 USB 优先，不能整批为空。"""
+        from ego_relay import orbbec_sdk as sdk
+
+        notes = []
+        orig_list, orig_single = sdk.list_devices, sdk.export_firmware_logs
+        sdk.list_devices = lambda *a, **k: self.DEVICES
+        sdk.export_firmware_logs = lambda out_dir, **kw: []
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                res = sdk.export_all_firmware_logs(
+                    tmp, prefer_ip="10.0.0.99", note_cb=notes.append)
+                self.assertEqual(len(res["ok"]), 3, res)
+                self.assertTrue(any("未找到 IP 10.0.0.99" in n for n in notes), notes)
         finally:
             sdk.list_devices, sdk.export_firmware_logs = orig_list, orig_single
 

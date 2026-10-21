@@ -214,7 +214,13 @@ def find_dll(explicit: str = "") -> str:
     if getattr(sys, "frozen", False):
         exe_dir = os.path.dirname(os.path.abspath(sys.executable))
         candidates.append(os.path.join(exe_dir, "lib", "EgoLowBle.dll"))
+        # 便携版把 PyInstaller 的内容目录叫 runtime/，DLL 由 spec 放进
+        # <exe 同级>/runtime/lib/。只查 _MEIPASS/lib 时，若 _MEIPASS 与
+        # runtime/ 不是同一层就会漏掉随包携带的这份。
+        runtime_dir = os.path.join(exe_dir, "runtime")
+        candidates.append(os.path.join(runtime_dir, "lib", "EgoLowBle.dll"))
         probes.append(exe_dir)
+        probes.append(runtime_dir)
 
     # 没装 EGOViewer 的机器上，退回到「已安装的 EGOViewer」常见位置：
     # 便携版解压目录、程序目录、以及各盘符根下的工具目录都在探测范围内。
@@ -431,7 +437,13 @@ class EgoLowBle:
     # ------------------------------------------------------------- 配网
     def configure_wifi(self, ssid: str, password: str,
                        timeout_ms: int = 0) -> dict:
-        """下发 Wi-Fi 配置（A001 协议）。返回 {result, reason}（result=0 成功）。"""
+        """下发 Wi-Fi 配置（A001 协议）。返回 {result, reason}（result=0 成功）。
+
+        设备端拒绝（result != 0，最常见是 Wi-Fi 密码错误 / SSID 不存在 / 5GHz 专用
+        频段）时直接抛 BleError：DLL 层面调用是成功的（rc=0），只有结构体里的
+        result 才表示业务结果。若不在这里中断，上层会以为"已下发、正在等联网"，
+        白等 40 秒超时且给不出任何有效提示。
+        """
         self._ensure()
         check_wifi_bytes(ssid, password)
         if timeout_ms <= 0:
@@ -441,10 +453,18 @@ class EgoLowBle:
             self._handle, ssid.encode("utf-8"), password.encode("utf-8"),
             timeout_ms, ctypes.byref(resp))
         self._check(rc, "配置 Wi-Fi")
-        return {
-            "result": int(resp.result),
-            "reason": resp.reason.decode("utf-8", "replace").strip("\x00"),
-        }
+        result = int(resp.result)
+        reason = resp.reason.decode("utf-8", "replace").strip("\x00")
+        if result != 0:
+            raise BleError(
+                f"设备拒绝了 Wi-Fi 配置（result={result}）"
+                + (f"：{reason}" if reason else "") + "\n"
+                "常见原因：\n"
+                "  · Wi-Fi 密码错误\n"
+                "  · Wi-Fi 名称（SSID）拼写错误或被隐藏\n"
+                "  · 该 Wi-Fi 为 5GHz 专用频段，设备仅支持 2.4GHz\n"
+                "  · Wi-Fi 名称/密码超过 32 个 UTF-8 字节")
+        return {"result": result, "reason": reason}
 
     def request_ip(self, timeout_ms: int = 0) -> dict:
         """请求设备 IP（A002 协议）。返回 {result, ip, reason}。"""

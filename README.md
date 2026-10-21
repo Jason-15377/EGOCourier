@@ -242,8 +242,26 @@ EGOCourier/
 
 ```bat
 python -m unittest tests.test_analysis -v     :: 对齐与四类异常规则单测
+python -m pytest tests -q                     :: 全量回归（114 项）
 python tests/smoke_gui.py                     :: 桌面 GUI 冒烟（offscreen）
 ```
+
+## 变更记录
+
+### v1.0.6（2026-10-21）缺陷修复
+
+| 编号 | 现象 | 修复 |
+|---|---|---|
+| T1 | 「重新检测」永远找不到 EGOViewer | 搜索根改为动态推导（环境变量 `EGO_VIEWER_ROOT` → 本工具所在盘 → 常见工具目录**及下一层**）；判据改为内容特征（`EGOViewer.exe` / `Log/EGOViewer_*.log` / 数据目录），不再依赖 `data/logs` 与 `win_x64` 字样；app 日志按 `Log → logs → data/logs` 查找 |
+| T2 | Wi-Fi 密码错误时配网失败无任何提示 | `configure_wifi` 校验设备返回的 `result`，被拒时直接抛 `BleError`；等待 IP 超时改为 `failed` + 红色弹窗；状态栏实时显示 `已等 N/40 秒` |
+| T3 | 固件日志报「未找到 OrbbecSDK.dll」 | `_candidate_dlls` 增加回退链（本工具 `runtime/lib` → EGOViewer 安装目录 → 搜索根）；界面新增「SDK 根目录」输入框，导出前预检 DLL |
+| T4 | 配网后的纯网络设备被静默跳过 | `device_host` 真正传给 SDK：`export_all_firmware_logs` 新增 `prefer_ip`/`prefer_port` 按 IP 精确定位设备，`include_network` 随配网 IP 自动开启；导出前 ping 目标设备 |
+| T5 | 固件日志缺时间戳层、重复导出互相覆盖 | 先拉到 `_staging`，再按 `firmware/<设备>/<YYYYMMDD-HHMMSS>/` 重组落盘，`rel` 与磁盘严格一致；同名同秒加时间戳后缀 |
+| T6 | 「找不到 DLL」被报成「设备未连接」 | `OrbbecSdkError` 增加 `kind`（dll / no_device / busy / fw_disabled / timeout / canceled），界面按类型给不同排查提示 |
+| — | 扫描列表混进鼠标/耳机等无关蓝牙设备 | 按名称前缀（`EGO_`/`UMIFinger_`/`WristCam_`/`EGOPro_`/`UMIGripper_`/`EGODepth_`）与 OUI `54:14:FD` 过滤，并按地址去重 |
+| — | 「设备 IP」预填 `10.9.82.9` 等测试值误导用户 | `DEVICE_IP` / `EXAMPLE_DEVICE_IP` 改为空，由配网结果或用户填写 |
+| — | firmware 分类把 `.lock`/`dmesg.txt`/`device_status.txt` 也收进包 | 改为按 `orbbec*.log*`、`messages.log*`、`observice.console.log*` 精确匹配 |
+| — | 便携版 `runtime/lib/EgoLowBle.dll` 可能找不到 | `find_dll` 增加 `<exe>/runtime/lib/` 探测 |
 
 ## 已知限制 / 待办
 

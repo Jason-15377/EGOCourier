@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import sys
 import threading
 import time
 from pathlib import Path
@@ -17,7 +18,40 @@ from . import config
 
 
 class OrbbecSdkError(RuntimeError):
-    """An SDK loading, device, callback, or export error."""
+    """An SDK loading, device, callback, or export error.
+
+    kind 用于让上层给用户精确的提示：把"缺 DLL"说成"设备未连接"会让用户排查方向
+    完全错误。取值见下方注释。
+    """
+
+    #: dll         —— 找不到 / 加载不了 OrbbecSDK.dll
+    #: no_device   —— 枚举不到任何设备
+    #: busy        —— 设备被其它进程占用（典型：EGOViewer 正在用）
+    #: fw_disabled —— 设备端固件日志功能未开启
+    #: timeout     —— 导出超时 / 静默收尾
+    #: canceled    —— 用户取消
+    #: other       —— 其它
+
+    def __init__(self, message: str, kind: str = "other"):
+        super().__init__(message)
+        self.kind = kind
+
+
+# SDK 原始错误串里用于识别失败类型的关键字（小写比较）。
+_BUSY_HINTS = ("occup", "in use", "already open", "占用", "device busy", "resource")
+_FWDIS_HINTS = ("firmware log", "already disabled", "disabled")
+
+
+def _classify_error(err) -> str:
+    """从 SDK 错误串推断失败类型。默认 other，不臆测。"""
+    if isinstance(err, OrbbecSdkError) and getattr(err, "kind", "other") != "other":
+        return err.kind
+    low = str(err).lower()
+    if any(h in low for h in _BUSY_HINTS):
+        return "busy"
+    if any(h in low for h in _FWDIS_HINTS):
+        return "fw_disabled"
+    return "other"
 
 
 # OBFwLogPacketState values from ObTypes.h.
@@ -27,6 +61,13 @@ PACKET_END = 2
 
 
 def _candidate_dlls(sdk_root: str = ""):
+    """按优先级产出候选 OrbbecSDK.dll 路径。
+
+    优先级：显式参数 → 配置 → 环境变量 → 本工具自带 lib → EGOViewer 安装目录
+            → 动态推导出的 EGOViewer 搜索根。
+    后两项是"找不到也不报错"的兜底：EGOViewer 安装包本身带一份 OrbbecSDK.dll，
+    装了 EGOViewer 的机器就应该能拉到固件日志，不该要求用户再手动配一次路径。
+    """
     roots = []
     if sdk_root:
         roots.append(Path(sdk_root))
@@ -35,8 +76,11 @@ def _candidate_dlls(sdk_root: str = ""):
     env = os.environ.get("ORBBEC_SDK_ROOT", "")
     if env:
         roots.append(Path(env))
+
+    found_any = False
     for root in roots:
         if root.is_file() and root.name.lower() == "orbbecsdk.dll":
+            found_any = True
             yield root
             continue
         if not root.is_dir():
@@ -47,7 +91,52 @@ def _candidate_dlls(sdk_root: str = ""):
             continue
         # Prefer the SDK runtime beside its import library over the Viewer copy.
         matches.sort(key=lambda p: ("\\bin\\" not in str(p).lower(), len(str(p))))
+        if matches:
+            found_any = True
         yield from matches
+
+    if found_any:
+        return
+
+    # ---- 兜底：上面没给路径，或给了路径但里面没有 DLL ----
+    # 1) 本工具自带 runtime/lib（便携版可随包携带一份）
+    for base in _tool_roots():
+        for rel in (Path("lib") / "OrbbecSDK.dll",
+                    Path("runtime") / "lib" / "OrbbecSDK.dll"):
+            d = base / rel
+            if d.is_file():
+                yield d
+    # 2) 已检测到的 EGOViewer 安装目录（最常见、最可靠）
+    try:
+        from . import evlog_pack
+        for ev in evlog_pack.find_ego_viewer_roots():
+            for rel in (Path("OrbbecSDK.dll"), Path("bin") / "OrbbecSDK.dll"):
+                p = Path(ev) / rel
+                if p.is_file():
+                    yield p
+        # 3) EGOViewer 搜索根本身（用户把 DLL 直接放在某层目录下的情况）
+        for sr in evlog_pack._candidate_search_roots():
+            p = Path(sr) / "OrbbecSDK.dll"
+            if p.is_file():
+                yield p
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _tool_roots() -> list:
+    """本工具可能的根目录（源码模式：runtime/app 的上一级；打包模式：exe 同级）。"""
+    out = []
+    base = Path(__file__).resolve().parent          # .../app/ego_relay
+    app_dir = base.parent                           # .../app
+    out.extend([app_dir, app_dir.parent])           # .../app, .../runtime
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).resolve().parent
+        out.insert(0, exe_dir)
+        out.insert(1, exe_dir / "runtime")
+    meipass = getattr(sys, "_MEIPASS", "")
+    if meipass:
+        out.insert(0, Path(meipass))
+    return [p for p in out if p.is_dir()]
 
 
 def find_sdk_dll(sdk_root: str = "") -> str:
@@ -160,7 +249,7 @@ class _SdkBindings:
         except OSError as exc:
             if self._dll_dir:
                 self._dll_dir.close()
-            raise OrbbecSdkError(f"加载 OrbbecSDK.dll 失败: {exc}") from exc
+            raise OrbbecSdkError(f"加载 OrbbecSDK.dll 失败: {exc}", kind="dll") from exc
         P = ctypes.c_void_p
         E = ctypes.POINTER(P)
         self._bind("ob_create_context", P, [E])
@@ -192,7 +281,7 @@ class _SdkBindings:
         try:
             fn = getattr(self.lib, name)
         except AttributeError as exc:
-            raise OrbbecSdkError(f"OrbbecSDK.dll 缺少导出符号: {name}") from exc
+            raise OrbbecSdkError(f"OrbbecSDK.dll 缺少导出符号: {name}", kind="dll") from exc
         fn.restype = restype
         fn.argtypes = argtypes
         setattr(self, name, fn)
@@ -274,7 +363,7 @@ def list_devices(sdk_root: str = "") -> list[dict]:
     """
     dll = find_sdk_dll(sdk_root)
     if not dll:
-        raise OrbbecSdkError("未找到 OrbbecSDK.dll，请在设置中指定 SDK 目录")
+        raise OrbbecSdkError("未找到 OrbbecSDK.dll，请在「SDK 根目录」中指定或确认已安装 EGOViewer", kind="dll")
     b = _SdkBindings(dll)
     ctx = device_list = None
     try:
@@ -338,6 +427,8 @@ def export_all_firmware_logs(root_dir: str, sdk_root: str = "",
                              firmware_idle_s: float = 15.0,
                              progress_cb: Optional[Callable[[int, str], None]] = None,
                              include_network: bool = False,
+                             prefer_ip: str = "",
+                             prefer_port: int = 0,
                              ) -> dict:
     """从**本机直连设备**各拉一份固件日志，按设备名分目录。
 
@@ -345,24 +436,50 @@ def export_all_firmware_logs(root_dir: str, sdk_root: str = "",
     却枚举到 5 台），因此默认跳过纯网络发现的设备，并在日志里说明跳过了谁。
     include_network=True 时连纯网络设备一起导（只有网线连接、没插 USB 的场景）。
 
+    prefer_ip：指定设备的 IP（来自 BLE 配网结果）。给定时优先只拉这台设备；
+               若枚举列表中找不到该 IP，则回退到原来的"USB 优先"挑选逻辑并提示。
+               配网后设备只走网络链路，此时 include_network 必须为 True，否则
+               select_devices 会把目标设备当"别人的设备"静默跳过。
+    prefer_port：prefer_ip 对应的 SDK 网络端口，默认取 config.ORBBEC_SDK_PORT。
+
     输出结构：<root_dir>/<设备名>/(其本次拉取产物)。同一设备因 USB + 网络重复枚举时
     只拉 USB 那条；同名设备（如两台 EGO-4B）在名称后追加序列号，避免互相覆盖。
 
     返回 {"ok": {设备目录: {"name","serial","connection","paths"}},
-          "errors": [{"name","serial","error"}],
+          "errors": [{"name","serial","error","kind"}],
           "skipped": [{"name","serial","ip"}]}
     """
     all_devices = list_devices(sdk_root)
     if not all_devices:
-        raise OrbbecSdkError("Orbbec SDK 未发现任何设备，请确认 USB / 网络链路已连接")
-    devices = select_devices(all_devices, include_network=include_network)
+        raise OrbbecSdkError("Orbbec SDK 未发现任何设备，请确认 USB / 网络链路已连接",
+                             kind="no_device")
+
+    picked_by_ip = False
+    devices = []
+    if prefer_ip:
+        target_ip = prefer_ip.strip().lower()
+        hit = [d for d in all_devices
+               if (d.get("ip") or "").strip().lower() == target_ip]
+        if hit:
+            devices = hit
+            picked_by_ip = True
+            if note_cb:
+                note_cb(f"按配网 IP 定位设备：{prefer_ip}（{len(hit)} 台）")
+        elif note_cb:
+            note_cb(f"枚举列表中未找到 IP {prefer_ip}，回退到 USB 优先挑选")
+    if not devices:
+        devices = select_devices(all_devices, include_network=include_network)
+
     skipped = [d for d in all_devices if d not in devices]
     if skipped and note_cb:
-        note_cb("跳过局域网设备（非 USB 直连）：" + "；".join(
+        reason = ("已按配网 IP 精确定位，其余设备未拉取" if picked_by_ip
+                  else "非 USB 直连")
+        note_cb(f"跳过 {len(skipped)} 台设备（{reason}）：" + "；".join(
             " · ".join(p for p in (d.get("name"), d.get("serial"),
                                    d.get("ip") and f"IP={d['ip']}") if p)
             for d in skipped))
 
+    port = int(prefer_port or config.ORBBEC_SDK_PORT or 8090)
     # 同名设备加序列号后缀区分
     name_counts = {}
     for d in devices:
@@ -371,7 +488,7 @@ def export_all_firmware_logs(root_dir: str, sdk_root: str = "",
     total = len(devices)
     for n, dev in enumerate(devices):
         if cancel_event is not None and cancel_event.is_set():
-            raise OrbbecSdkError("固件日志导出已取消")
+            raise OrbbecSdkError("固件日志导出已取消", kind="canceled")
         base = dev.get("name") or "device"
         if name_counts.get(dev.get("name") or "device", 0) > 1 and dev.get("serial"):
             base = f"{base}_{dev['serial']}"
@@ -384,15 +501,18 @@ def export_all_firmware_logs(root_dir: str, sdk_root: str = "",
             paths = export_firmware_logs(
                 os.path.join(root_dir, folder), sdk_root=sdk_root,
                 device_index=int(dev.get("index", 0)),
+                # 网络枚举到的设备带上 IP：export_firmware_logs 会按 IP 精确匹配，
+                # 避免设备列表顺序变化时按 index 选错设备。USB 设备 IP 为空，行为不变。
+                device_ip=(dev.get("ip") or ""), device_port=port,
                 timeout_s=timeout_s, cancel_event=cancel_event,
                 firmware_idle_s=firmware_idle_s, note_cb=note_cb,
                 progress_cb=(None if progress_cb is None else
                              (lambda pct, fname, _n=n: progress_cb(
                                  int((_n * 100 + pct) / max(total, 1)), fname))))
         except OrbbecSdkError as e:
-            # 单台失败不影响其它设备，最后统一汇报
+            # 单台失败不影响其它设备，最后统一汇报（带 kind 供上层给精确提示）
             errors.append({"name": dev.get("name"), "serial": dev.get("serial"),
-                           "error": str(e)})
+                           "error": str(e), "kind": getattr(e, "kind", "other")})
             if note_cb:
                 note_cb(f"设备 {label} 拉取失败：{e}")
             continue
@@ -442,7 +562,7 @@ def export_firmware_logs(output_dir: str, sdk_root: str = "", device_index: int 
     """
     dll = find_sdk_dll(sdk_root)
     if not dll:
-        raise OrbbecSdkError("未找到 OrbbecSDK.dll，请在设置中指定 SDK 目录")
+        raise OrbbecSdkError("未找到 OrbbecSDK.dll，请在「SDK 根目录」中指定或确认已安装 EGOViewer", kind="dll")
     b = _SdkBindings(dll)
     ctx = device_list = device = None
     callback_ref = None
@@ -487,11 +607,11 @@ def export_firmware_logs(output_dir: str, sdk_root: str = "", device_index: int 
                     device_list = b.call(b.ob_query_device_list, ctx)
                 count = int(b.call(b.ob_device_list_get_count, device_list))
                 if count <= device_index:
-                    raise OrbbecSdkError("Orbbec SDK 未发现可导出的设备，请确认 USB/SDK 网络链路已连接")
+                    raise OrbbecSdkError("Orbbec SDK 未发现可导出的设备，请确认 USB/SDK 网络链路已连接", kind="no_device")
                 device = b.call(b.ob_device_list_get_device, device_list, int(device_index))
                 picked_index = int(device_index)
         if not device:
-            raise OrbbecSdkError("SDK 获取设备句柄失败")
+            raise OrbbecSdkError("SDK 获取设备句柄失败", kind="no_device")
         if note_cb and device_list is not None:
             note_cb(f"已选中设备 {_describe_device(b, device_list, picked_index)}")
 
@@ -524,16 +644,16 @@ def export_firmware_logs(output_dir: str, sdk_root: str = "", device_index: int 
         silent_finish = False
         while not finished.wait(0.2):
             if cancel_event and cancel_event.is_set():
-                raise OrbbecSdkError("固件日志导出已取消")
+                raise OrbbecSdkError("固件日志导出已取消", kind="canceled")
             if writer.error:
-                raise OrbbecSdkError(str(writer.error))
+                raise OrbbecSdkError(str(writer.error), kind=_classify_error(writer.error))
             if writer.paths and time.monotonic() - last_packet[0] > idle_s:
                 silent_finish = True
                 break
             if timeout_s is not None and time.monotonic() - start > timeout_s:
-                raise OrbbecSdkError("等待固件日志导出完成超时")
+                raise OrbbecSdkError("等待固件日志导出完成超时", kind="timeout")
         if writer.error:
-            raise OrbbecSdkError(str(writer.error))
+            raise OrbbecSdkError(str(writer.error), kind=_classify_error(writer.error))
         if silent_finish and note_cb:
             note_cb(
                 f"设备未上报完成（已收 {len(writer.paths)} 个文件，"

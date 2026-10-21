@@ -36,7 +36,7 @@ class BleScanWorker(QThread):
 
 
 class BleProvisionWorker(QThread):
-    done = Signal(str)   # 设备 IP
+    done = Signal(str)   # 设备 IP（只在拿到 IP 时发出）
     failed = Signal(str)
 
     def __init__(self, address, ssid, password):
@@ -47,6 +47,12 @@ class BleProvisionWorker(QThread):
         try:
             from ego_relay import ble_provision
             r = ble_provision.provision(self.address, self.ssid, self.password)
+            if not r.get("connected") or not r.get("ip"):
+                self.failed.emit(
+                    "等待设备联网超时（未拿到 IP）。\n"
+                    "请确认：Wi-Fi 密码正确、路由器未开启 MAC 过滤/客户端隔离，"
+                    "并优先尝试 2.4GHz 频段或手机热点。")
+                return
             self.done.emit(r.get("ip", ""))
         except Exception as e:  # noqa: BLE001
             self.failed.emit(str(e))
@@ -224,9 +230,6 @@ class ExportTab(QWidget):
         self.btn_ble_apply.setEnabled(self.cmb_ble.count() > 0)
         self.log(f"蓝牙扫描完成: 发现 {len(devices)} 台设备，请选择后填写 Wi-Fi 配置")
 
-    def _on_ble_fail(self, msg):
-        self.log(f"蓝牙扫描失败: {msg}")
-
     def _apply_ble(self):
         address = self.cmb_ble.currentData()
         ssid = self.edit_ble_ssid.text().strip()
@@ -246,11 +249,17 @@ class ExportTab(QWidget):
         self._ble_worker.start()
 
     def _on_ble_done(self, ip):
-        if ip:
-            self.edit_ip.setText(ip)
-            self.log(f"配网成功：设备 IP = {ip}，已自动填入 SSH 配置")
-        else:
-            self.log("配网已下发，但未在超时内拿到设备 IP；请到设备信息页确认是否已联网")
+        self.edit_ip.setText(ip)
+        self.log(f"配网成功：设备 IP = {ip}，已自动填入 SSH 配置")
+
+    def _on_ble_fail(self, msg):
+        """配网/扫描失败统一入口：写日志 + 弹窗。
+
+        以前只写一行日志，用户看不到失败原因（尤其密码错误时既不报错也不提示）。
+        扫描失败的文案已足够说明问题，这里不再额外区分来源。
+        """
+        self.log(f"配网/扫描失败: {msg}")
+        QMessageBox.critical(self, "操作失败", str(msg))
 
     # ---------------- SSH 一键导出 ----------------
     def _pick_local(self):
