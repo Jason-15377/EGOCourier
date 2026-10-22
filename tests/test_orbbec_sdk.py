@@ -389,5 +389,57 @@ class TestUsbFirstSelection(unittest.TestCase):
             sdk.list_devices, sdk.export_firmware_logs = orig_list, orig_single
 
 
+class TestNoImplicitNetworkExport(unittest.TestCase):
+    """填了「设备 IP」不等于"把局域网里所有设备都导一遍"。
+
+    现场问题：局域网里有 7 台设备（3 台本机 USB + 4 台别人的 Ethernet），用户在
+    「设备 IP」框里留着上一次配网的 IP 后导出，4 台别人的设备也被拉了下来。
+    UI 侧因此固定传 include_network=False（见 device_tab._pull_firmware_from_device），
+    这里断言的就是这条调用契约。
+    """
+
+    DEVICES = TestUsbFirstSelection.DEVICES
+
+    def _pull(self, **kw):
+        from ego_relay import orbbec_sdk as sdk
+
+        pulled = []
+        orig_list, orig_single = sdk.list_devices, sdk.export_firmware_logs
+        sdk.list_devices = lambda *a, **k: self.DEVICES
+        sdk.export_firmware_logs = lambda out_dir, **kw2: (
+            pulled.append(kw2.get("device_ip")) or [])
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                res = sdk.export_all_firmware_logs(tmp, **kw)
+        finally:
+            sdk.list_devices, sdk.export_firmware_logs = orig_list, orig_single
+        return res, pulled
+
+    def test_empty_ip_keeps_only_usb(self):
+        """不填 IP：只导本机 3 台 USB，局域网设备一律跳过。"""
+        res, pulled = self._pull(include_network=False)
+        self.assertEqual(len(res["ok"]), 3, res["ok"])
+        # USB 设备枚举到的 IP 是 0.0.0.0，按 IP 匹配时不会误选
+        self.assertEqual(pulled, ["0.0.0.0"] * 3)
+        self.assertEqual(len(res["skipped"]), 2)
+
+    def test_stale_ip_from_provisioning_does_not_open_network(self):
+        """框里留着配网 IP、include_network=False：只拉那一台，其余网络设备仍跳过。"""
+        res, pulled = self._pull(include_network=False, prefer_ip="192.168.1.101")
+        self.assertEqual(len(res["ok"]), 1, res["ok"])
+        self.assertEqual(pulled, ["192.168.1.101"])
+        self.assertEqual(len(res["skipped"]), 4)
+
+    def test_ui_never_requests_network_enumeration(self):
+        """UI 的固件拉取路径必须固定 include_network=False。"""
+        import inspect
+
+        from ego_gui import device_tab
+
+        src = inspect.getsource(device_tab._pull_firmware_from_device)
+        self.assertIn("include_network=False", src)
+        self.assertNotIn("include_network=bool(", src)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

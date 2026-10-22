@@ -248,6 +248,15 @@ python tests/smoke_gui.py                     :: 桌面 GUI 冒烟（offscreen�
 
 ## 变更记录
 
+### v1.0.7（2026-10-21）缺陷修复
+
+| 编号 | 现象 | 修复 |
+|---|---|---|
+| T1 | 明明选了包含固件日志的时间段，导出包里 firmware 仍为空 | `filter_firmware_pull` 不再拿「点按钮那一刻」去和 `[start, end]` 比对：固件日志是设备端当前全量快照，拉取时刻必然晚于用户设定的「止」（出问题 → 调时间段 → 点导出），原来只放宽 2 秒会把整批剔除。现改为只校验起点（`pulled_at >= start`），止侧不限；起点晚于拉取时刻仍剔除并提示 |
+| T2 | 任务进度条走系统原生绿色样式，与同行按钮不同高 | `app.py` 的 `STYLE` 补 `QProgressBar#taskProgress` 规则（白底浅灰槽 + `#3b82f6` 蓝色填充、4px 圆角）；进度条与三个按钮统一 `setFixedHeight(34)` |
+| T3 | 进度条会往回跳、界面卡顿 | 各段占比收敛到一张 `PROGRESS_STAGES` 表（firmware 0–55 / stage 55–80 / mobile 80–92 / pack 92–96 / import 96–100），不再各自硬编码 `50 + pct*0.5`、`60~100`；`pack_staged` 的合并进度按份额表拆回 stage / pack；UI 侧加 `_ThrottledProgress`（丢回退、16ms 合帧、0/100 立即生效） |
+| T4 | 本机只插 3 台 USB，导出却把局域网里别人的设备日志也全拉了一遍 | 「设备 IP」框非空曾让 `include_network=True`，`select_devices` 于是返回「USB + 全部网络设备」。现 UI 固定传 `include_network=False`，IP 只作为 `prefer_ip` 精确命中那一台（该命中不受 USB 优先筛选限制）。「没插 USB 时能导 Ethernet」由 `select_devices` 的无 USB 兜底保证，不依赖放开枚举。实测本机枚举 6 台、只导 3 台 USB |
+
 ### v1.0.6（2026-10-21）缺陷修复
 
 | 编号 | 现象 | 修复 |

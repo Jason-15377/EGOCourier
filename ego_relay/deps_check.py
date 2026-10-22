@@ -35,6 +35,17 @@ MIN_VERSION = (3, 10)
 RECOMMENDED_VERSION = (3, 12)
 MAX_TESTED_VERSION = (3, 12)
 
+# 主要包的版本上限（不含边界，与 requirements.txt 的 ``<X`` 一致）。
+# 只装「包名」而不带约束时，新电脑的 pip 会拉到最新版（实测 PySide6 6.12 /
+# matplotlib 3.11 / numpy 2.5），超出本程序验证过的范围后 GUI 会起不来；
+# 而旧的缺失检测只看「能否 import」，会把越界版本判成齐全并永远跳过安装。
+# 维护提醒：改 requirements.txt 的版本约束时，这里必须同步改。
+VERSION_CAPS: dict[str, str] = {
+    "PySide6": "6.9",
+    "matplotlib": "3.11",
+    "numpy": "2.3",
+}
+
 
 def version_tuple(text: str | None = None) -> tuple[int, int, int]:
     v = text or sys.version
@@ -89,14 +100,49 @@ def _importable(import_name: str) -> bool:
         return False
 
 
+def _ver_tuple(text: str) -> tuple[int, ...]:
+    """极简版本号解析：只取每段的开头数字（"6.8.3" -> (6, 8, 3)）。
+
+    本模块必须零第三方依赖，不能借用 packaging，所以自备一个够用的比较。
+    """
+    out: list[int] = []
+    for part in str(text or "").split("."):
+        digits = ""
+        for ch in part:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        if not digits:
+            break
+        out.append(int(digits))
+    return tuple(out)
+
+
+def _too_new(pip_name: str, version: str | None) -> bool:
+    """已装版本是否超出 VERSION_CAPS 的上限。"""
+    cap = VERSION_CAPS.get(pip_name)
+    if not cap or not version:
+        return False
+    got, want = _ver_tuple(version), _ver_tuple(cap)
+    if not got or not want:
+        return False
+    return got >= want
+
+
 def missing(include_optional: bool = True) -> list[tuple[str, str, bool, str]]:
-    """返回缺失的包：[(显示名, pip 包名, 是否必需, 影响)]。"""
+    """返回缺失（或版本越界）的包：[(显示名, pip 包名, 是否必需, 影响)]。"""
     out = []
     for display, import_name, pip_name, required, impact in PACKAGES:
         if not include_optional and not required:
             continue
         if not _importable(import_name):
             out.append((display, pip_name, required, impact))
+            continue
+        ver = installed_version(import_name)
+        if _too_new(pip_name, ver):
+            out.append((display, pip_name, required,
+                        f"已装 {ver}，超出要求的 <{VERSION_CAPS[pip_name]}，需降级"))
     return out
 
 
@@ -105,11 +151,16 @@ def missing_required() -> list[tuple[str, str, bool, str]]:
 
 
 def summary_rows() -> list[tuple[str, str, bool]]:
-    """供打印的检查表：[(显示名, 版本或“缺失”, 是否缺失)]。"""
+    """供打印的检查表：[(显示名, 版本或“缺失”, 是否缺失)]。
+
+    版本越界也算「缺失」——否则 ``--check`` 会报「依赖齐全」，而实际版本
+    已超出验证范围、GUI 起不来。
+    """
     rows = []
-    for display, import_name, _pip, _req, _impact in PACKAGES:
+    for display, import_name, pip_name, _req, _impact in PACKAGES:
         ver = installed_version(import_name)
-        rows.append((display, ver or "未安装", ver is None))
+        bad = ver is None or _too_new(pip_name, ver)
+        rows.append((display, ver or "未安装", bad))
     return rows
 
 

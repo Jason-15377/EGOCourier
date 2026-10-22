@@ -87,6 +87,14 @@ QLabel#statLabel { font-size:12px; color:#6b7280; }
 QFrame#logTypeRow { background:#f5f6f8; border:1px solid #e5e7eb; border-radius:6px; }
 QFrame#logTypeCard { background:#ffffff; border:1px solid #e2e5ea; border-radius:6px; }
 QSplitter::handle { background:#e5e7eb; width:2px; }
+/* ---- 进度条（与同排 34px 按钮同高、圆角同 4px，去掉系统原生绿色块） ----
+   高度由代码 setFixedHeight(34) 固定，QSS 只负责外观：白底浅灰槽 + 蓝色填充，
+   文字居中压在填充层上，与同排按钮的文字位置一致。 */
+QProgressBar#taskProgress { background:#ffffff; border:1px solid #d1d5db;
+  border-radius:4px; padding:0 8px; text-align:center; color:#374151;
+  font-size:12px; }
+QProgressBar#taskProgress::chunk { background:#3b82f6; border-radius:3px;
+  margin:3px; }
 """
 
 # 顶部 Tab 顺序持久化：存到 data/tab_order.json（与 thresholds.json 同一目录），

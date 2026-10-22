@@ -430,16 +430,20 @@ def export_all_firmware_logs(root_dir: str, sdk_root: str = "",
                              prefer_ip: str = "",
                              prefer_port: int = 0,
                              ) -> dict:
-    """从**本机直连设备**各拉一份固件日志，按设备名分目录。
+    """从**本机应该导出的设备**各拉一份固件日志，按设备名分目录。
 
     USB 直连优先：GVCP 网络枚举会把整个局域网里的设备都扫出来（实测本机只有 3 台，
-    却枚举到 5 台），因此默认跳过纯网络发现的设备，并在日志里说明跳过了谁。
-    include_network=True 时连纯网络设备一起导（只有网线连接、没插 USB 的场景）。
+    却枚举到 5 台以上），因此默认跳过纯网络发现的设备，并在日志里说明跳过了谁。
+    一台 USB 都没有时 select_devices 会自动退回全部设备，所以"只用网线连"的场景
+    不需要靠 include_network 就能导出。
 
-    prefer_ip：指定设备的 IP（来自 BLE 配网结果）。给定时优先只拉这台设备；
-               若枚举列表中找不到该 IP，则回退到原来的"USB 优先"挑选逻辑并提示。
-               配网后设备只走网络链路，此时 include_network 必须为 True，否则
-               select_devices 会把目标设备当"别人的设备"静默跳过。
+    include_network=True 仅用于调用方**明确**要求"连网络设备一起导"。它会把局域网里
+    别人机器上的设备也一并导出，因此 UI 不应因为"填了设备 IP"就打开它——要定位
+    单台设备请用 prefer_ip。
+
+    prefer_ip：指定设备的 IP（来自 BLE 配网结果）。命中的设备不受 USB 优先筛选限制
+               （纯网络设备也能拉）；若枚举列表中找不到该 IP，则回退到原来的
+               "USB 优先"挑选逻辑并提示。
     prefer_port：prefer_ip 对应的 SDK 网络端口，默认取 config.ORBBEC_SDK_PORT。
 
     输出结构：<root_dir>/<设备名>/(其本次拉取产物)。同一设备因 USB + 网络重复枚举时

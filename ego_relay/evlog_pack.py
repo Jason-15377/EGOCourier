@@ -458,15 +458,20 @@ def filter_firmware_pull(fw_paths: list, pulled_at: float,
     为准，写入按拉取时间戳命名的子目录（YYYYMMDD-HHMMSS/）后即可与 app/sdk 一样
     用同一套 [start, end] 判定。pulled_at 落在窗口内则整批保留，否则整批剔除。
 
-    容差：拉取时刻与界面上的"止"（end）往往只差几毫秒到一两秒（终点跟随当前时刻），
-    若严格比较会把刚好落在终点附近的整批固件日志误剔除，故对 end 放宽 2 秒。
+    固件日志代表的是"设备端当前这份日志的全量快照"，而工单场景几乎总是
+    「出问题 → 调时间段 → 点导出」：pulled_at 必然在 end 之后（用户先看日志再点
+    按钮），只对 end 放宽常数容差仍会整批剔除。因此 end 侧不做上限判定：开始时刻
+    仍在窗口内（pulled_at >= start）即保留。start 侧仍严格判定——窗口起点晚于
+    拉取时刻时，固件日志里根本没有那段时间的内容。
+
+    end=None（不限止）时 end 侧恒为真，与以往语义一致。
 
     返回 (kept_paths, stamp, within)：stamp 为本次拉取时间戳，within 表示是否命中窗口。
     """
-    tol = 2.0
-    if _within(pulled_at, pulled_at, None, start, None if end is None else end + tol):
-        return list(fw_paths), pulled_at, True
-    return [], pulled_at, False
+    del end  # 止时间不再限制固件日志：快照必然晚于用户设定的 end
+    if start is not None and pulled_at < float(start):
+        return [], pulled_at, False
+    return list(fw_paths), pulled_at, True
 
 
 def collect(root: str, keys=None, max_age_days=None, max_count=None,

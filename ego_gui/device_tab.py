@@ -17,7 +17,8 @@ import time
 from datetime import datetime
 from typing import Dict
 
-from PySide6.QtCore import Qt, QThread, Signal, QSettings, QPoint, QRect, QEvent, QDateTime, QTime, QTimer
+from PySide6.QtCore import (Qt, QThread, Signal, QSettings, QPoint, QRect, QEvent,
+                            QDateTime, QTime, QTimer, QElapsedTimer, QObject)
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QPushButton, QFileDialog,
@@ -27,7 +28,7 @@ from PySide6.QtWidgets import (
     QScrollArea, QListWidget, QListWidgetItem, QToolButton,
     QDateTimeEdit, QDialog, QDialogButtonBox, QAbstractSpinBox,
     QTimeEdit, QCalendarWidget,
-    QTreeWidget, QTreeWidgetItem, QAbstractItemView,
+    QTreeWidget, QTreeWidgetItem, QAbstractItemView, QSizePolicy,
 )
 
 from .export_tab import BleScanWorker  # 复用：BLE 扫描后台线程
@@ -227,6 +228,11 @@ class EvLogPackWorker(QThread):
         # 设备拉取的固件日志先落在 work 之外的暂存目录，再由 stage 复制进 work/<分类>/，
         # 否则源路径与 stage 目标路径相同，Windows 上 shutil.copy2 会报 WinError 32。
         pull_work = tempfile.mkdtemp(prefix="evlog_fw_")
+        # pack_staged 的 progress_cb 是一个 0..100 的合并进度：stage 占前 60（与
+        # evlog_pack.stage 的映射一致），压缩占后 40。若本任务不收集本机 app/sdk
+        # （只勾固件），stage 份额为 0，整段归到压缩。
+        staged_share = 60 if ("app" in self.keys or "sdk" in self.keys) else 0
+        pack_cb = _sub([("stage", staged_share), ("pack", 40)])
         try:
             external = {}
             # firmware 与「一键导出」同一条通道：经 Orbbec SDK 从设备实时拉取，
@@ -239,7 +245,7 @@ class EvLogPackWorker(QThread):
                     device_host=self.device_host, sdk_port=self.sdk_port,
                     sdk_root=self.sdk_root)
                 puller.status.connect(self.status.emit)
-                puller.progress.connect(lambda pct: self.progress.emit(int(pct * 0.5)))
+                puller.progress.connect(self.progress.emit)
                 puller.cancel_event = self.cancel_event
                 paths = puller._pull_firmware(fw_root, pull_at, orbbec_sdk, config)
                 if paths:
@@ -247,7 +253,7 @@ class EvLogPackWorker(QThread):
             self.status.emit("收集并筛选日志…")
             _staged, collected = evlog_pack.stage(
                 self.root, work, self.keys,
-                progress_cb=lambda pct: self.progress.emit(int(pct * 0.5)),
+                progress_cb=lambda pct: self.progress.emit(_stage_map("stage", pct)),
                 should_cancel=self._want_cancel,
                 external=external,
                 **self.stage_kwargs)
@@ -260,7 +266,7 @@ class EvLogPackWorker(QThread):
                 max_age_days=self.stage_kwargs.get("max_age_days"),
                 start=self.stage_kwargs.get("start"),
                 end=self.stage_kwargs.get("end"),
-                progress_cb=lambda pct: self.progress.emit(pct),
+                progress_cb=lambda pct: self.progress.emit(pack_cb(pct)),
                 should_cancel=self._want_cancel)
             self.status.emit(f"打包完成：{zip_path}")
 
@@ -352,9 +358,12 @@ def _pull_firmware_from_device(fw_root, at, sdk_root, orbbec_sdk, config,
     _staging，再逐文件 move 到目标位置。这样同时解决"rel 与磁盘不符"和"同一目录
     重复导出互相覆盖"两个问题，同名同秒的产物再加时间戳后缀兜底。
 
-    device_host / prefer_ip：配网拿到的设备 IP。设备配网后只走网络链路（USB 一插
-    就无法同时建立 Wi-Fi 连接），必须把它传给 SDK，否则纯网络设备会被当成
-    "局域网里别人的设备"静默跳过。
+    device_host / prefer_ip：配网拿到的设备 IP。它只作为**精确定位**条件传给 SDK
+    （prefer_ip），命中的那一台不论 USB 还是 Ethernet 都会被拉取。
+
+    这里**不**传 include_network：局域网里 GVCP 广播能把别人机器上的一堆设备都扫出来，
+    一旦放开，本机只插 3 台 USB 也会把整个网段的设备全导一遍。而"本机没插 USB"的场景
+    SDK 侧已有兜底（select_devices 在一台 USB 都没有时返回全部设备），不需要靠它。
     """
     import shutil
 
@@ -365,7 +374,7 @@ def _pull_firmware_from_device(fw_root, at, sdk_root, orbbec_sdk, config,
          "（保持设备连接）")
     target_ip = (prefer_ip or device_host or "").strip()
     if target_ip:
-        emit(f"目标设备 IP：{target_ip}（配网结果，将优先按此 IP 拉取）")
+        emit(f"目标设备 IP：{target_ip}（将按此 IP 精确定位该设备）")
 
     stage_root = os.path.join(fw_root, "_staging")
     os.makedirs(stage_root, exist_ok=True)
@@ -375,8 +384,8 @@ def _pull_firmware_from_device(fw_root, at, sdk_root, orbbec_sdk, config,
             cancel_event=cancel_event,
             note_cb=emit,
             progress_cb=lambda pct, name: prog(pct),
-            # 有配网 IP 说明设备只走网络链路，此时必须允许网络设备参与
-            include_network=bool(target_ip),
+            # 不放开网络枚举：IP 只用来精确定位那一台（见函数说明）。
+            include_network=False,
             prefer_ip=target_ip,
             prefer_port=int(port or 0))
     except orbbec_sdk.OrbbecSdkError as e:
@@ -427,6 +436,132 @@ def _pull_firmware_from_device(fw_root, at, sdk_root, orbbec_sdk, config,
 
 
 # ---------------------------------------------------------------------------
+# 一键导出 / 打包导出 进度阶段占比表（0..100）
+#   一次任务里各阶段串行执行，每段子进度（0..100）只映射到本段区间，互不重叠。
+#   改比例只改这里，避免各调用点各自写 0.5 / 50 / 60 这类魔法数导致区间重叠和回退。
+#   未勾选的阶段由调用方跳过，进度只会停在上一段末尾，不会回退。
+# ---------------------------------------------------------------------------
+PROGRESS_STAGES = {
+    "firmware": (0, 55),     # Orbbec SDK 从设备实时拉取固件日志（通常最慢）
+    "stage": (55, 80),       # 本机 app/sdk 收集、筛选、复制到工作目录
+    "mobile": (80, 92),      # adb 拉取手机日志
+    "pack": (92, 96),        # 本地打包（仅"打包导出"）
+    "import": (96, 100),     # 导入 EGO Courier 并对齐分析
+}
+
+
+def _stage_map(name: str, pct, reserve=None) -> int:
+    """把某阶段子进度 pct(0..100) 映射到该阶段的全局区间，返回 0..100。
+
+    子进度 100 只映射到 hi-1：区间右端是"下一段起点"，满额时也不越过它，
+    这样进度条到 100 只可能来自任务真正的完成点。
+
+    reserve：本段在当前任务里不会再执行的后续阶段，取其中最高终点，避免提前
+    走到 100% 让人误以为已完成（例如单台手机拉完就停在 92 而不是 100）。
+    """
+    lo, hi = PROGRESS_STAGES[name]
+    if reserve:
+        hi = min(hi, reserve - 1)
+    span = max(hi - lo, 1)
+    try:
+        p = max(0.0, min(100.0, float(pct)))
+    except (TypeError, ValueError):
+        p = 0.0
+    return lo + min(int(p * span / 100), span - 1)
+
+
+def _sub(shares):
+    """按份额表 [("stage", 60), ("pack", 40)] 生成一个把 0..100 子进度打成全局进度的
+
+    回调。份额表描述的是"这段回调里前多少属于哪个阶段"，份额为 0 的段自动忽略
+    （例如没有可收集的 app/sdk 时，pack_staged 的进度直接归到 pack 段）。
+    """
+    return _ProgressMeter(shares)
+
+
+class _ProgressMeter:
+    """把多个阶段共用的一条 0..100 子进度拆回各阶段区间。
+
+    例：pack_staged 只有一个 progress_cb，但它其实先 stage（55~80）再压缩（92~96）。
+    份额表 [("stage", 60), ("pack", 40)] 表示回调的 0..60 属于 stage、60..100 属于
+    pack；本类把子进度按名额切段后交给 _stage_map，各自打到自己的区间。
+    """
+
+    def __init__(self, shares):
+        self.shares = [(name, float(w)) for name, w in shares if w > 0]
+        self.total = sum(w for _n, w in self.shares) or 100.0
+
+    def __call__(self, pct) -> int:
+        try:
+            p = max(0.0, min(100.0, float(pct)))
+        except (TypeError, ValueError):
+            p = 0.0
+        acc = 0.0
+        for name, w in self.shares:
+            end = acc + w * 100.0 / self.total
+            if p <= end:
+                return _stage_map(name, (p - acc) * 100.0 / w)
+            acc = end
+        return _stage_map(self.shares[-1][0], 100)
+
+
+# ---------------------------------------------------------------------------
+# 进度条节流：工作线程会高频发进度（SDK 每收一个数据包一次、每复制一个文件一次），
+# 直接 setValue 会让界面卡顿，且阶段切换时偶发的乱序旧值会让条子往回跳。
+#   · 单调：只接受比当前值大的进度，回退一律丢弃；
+#   · 限频：同一动画帧内最多刷新一次（16ms），期间只记住最新值；
+#   · 0 与 100 立即生效（开始/结束是状态变化，不能被节流吞掉）。
+# ---------------------------------------------------------------------------
+class _ThrottledProgress(QObject):
+    MIN_INTERVAL_MS = 16
+
+    def __init__(self, bar: QProgressBar):
+        super().__init__(bar)
+        self._bar = bar
+        self._pending = -1
+        self._clock = QElapsedTimer()
+        self._clock.start()
+        self._last_ms = -10_000
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self._flush)
+
+    def reset(self):
+        self._timer.stop()
+        self._pending = -1
+        self._last_ms = -10_000
+
+    def set_value(self, value):
+        try:
+            v = int(value)
+        except (TypeError, ValueError):
+            return
+        v = max(0, min(100, v))
+        if v <= self._bar.value() and v != 0:
+            return                      # 不回退：丢弃落后/重复值
+        elapsed = self._clock.elapsed()
+        wait = self._last_ms + self.MIN_INTERVAL_MS - elapsed
+        if wait <= 0 or v in (0, 100):
+            self._apply(v, elapsed)
+        else:
+            self._pending = v
+            if not self._timer.isActive():
+                self._timer.start(int(wait))
+
+    def _flush(self):
+        if self._pending < 0:
+            return
+        v = self._pending
+        self._pending = -1
+        if v > self._bar.value() or v == 0:
+            self._apply(v, self._clock.elapsed())
+
+    def _apply(self, v, elapsed):
+        self._last_ms = elapsed
+        self._bar.setValue(v)
+
+
+# ---------------------------------------------------------------------------
 # 一键导出后台线程：识别 EGOViewer 根目录 → 全新时间戳目录收集所选分类日志 → 导入分析 + 报告
 #   每次都在输出目录下新建 EGO_export_<时间戳>/，从源目录现拉最新日志，不复用本地旧日志。
 #   app/sdk 按当前筛选方式（时间段 / 手动勾选）筛选后收集。
@@ -474,18 +609,20 @@ class EgoOneClickExportWorker(QThread):
         start = self.stage_kwargs.get("start")
         end = self.stage_kwargs.get("end")
         pull_name = datetime.fromtimestamp(pull_at).strftime("%Y%m%d-%H%M%S")
+        if self.cancel_event.is_set():
+            raise evlog_pack.OperationCancelled("操作已取消")
 
         _kept, _stamp, within = evlog_pack.filter_firmware_pull(
             [], pull_at, start=start, end=end)
         if not within:
             self.status.emit(
-                f"本次固件日志拉取时间 {pull_name} 不在所选时间段内，跳过 firmware"
-                "（如需包含请调整时间段）")
+                f"本次固件日志拉取时间 {pull_name} 早于所选时间段起点，跳过 firmware"
+                "（如需包含请把时间段起点往前调）")
             return []
         items = _pull_firmware_from_device(
             fw_root, pull_at, self.sdk_root, orbbec_sdk, config,
             status=self.status.emit,
-            progress=lambda pct: self.progress.emit(50 + int(pct * 0.5)),
+            progress=lambda pct: self.progress.emit(_stage_map("firmware", pct)),
             cancel_event=self.cancel_event,
             device_host=self.device_host, port=self.sdk_port)
         # 固件日志的时间判定统一按「本次拉取时刻」，与 per-file 无关，这里只做整体命中判定
@@ -528,13 +665,13 @@ class EgoOneClickExportWorker(QThread):
                 self.status.emit(
                     "已勾选手机日志：固件日志取自手机导出（<机型>/固件日志/），"
                     "跳过电脑 USB 直连拉取")
-            # app/sdk：从本机 EGOViewer 根目录收集（进度 0–50），按当前筛选方式应用时间/手动筛选
+            # app/sdk：从本机 EGOViewer 根目录收集，按当前筛选方式应用时间/手动筛选
             app_sdk = [k for k in self.keys if k not in ("firmware", "mobile")]
             if app_sdk:
                 self.status.emit("收集 app/SDK 日志…")
                 _staged, c = evlog_pack.stage(
                     self.root, export_dir, app_sdk,
-                    progress_cb=lambda pct: self.progress.emit(int(pct * 0.5)),
+                    progress_cb=lambda pct: self.progress.emit(_stage_map("stage", pct)),
                     should_cancel=self._want_cancel,
                     **self.stage_kwargs)
                 collected.update(c)
@@ -548,15 +685,20 @@ class EgoOneClickExportWorker(QThread):
                 if not adb:
                     raise RuntimeError(
                         "未找到 adb，请安装 Android platform-tools 并加入 PATH")
+                # 单台手机的内部进度（导出包/sdk/固件）按台数平摊到 mobile 段
                 n_ph = len(self.mobile_serials)
                 for i, serial in enumerate(self.mobile_serials):
                     self.status.emit(f"[{i + 1}/{n_ph}] 拉取手机 {serial} 的日志…")
-                    base = 50 + i * 45 // max(n_ph, 1)
+                    self.progress.emit(
+                        _stage_map("mobile", i * 100 / n_ph,
+                                   reserve=PROGRESS_STAGES["import"][0]))
                     mobile_adb.pull_all(
                         adb, serial, export_dir,
                         note=self.status.emit,
-                        progress=lambda pct, b=base: self.progress.emit(
-                            int(b + pct * 0.45 / max(n_ph, 1))),
+                        progress=lambda pct, _i=i: self.progress.emit(
+                            _stage_map(
+                                "mobile", (_i * 100 + min(float(pct or 0), 100.0)) / n_ph,
+                                reserve=PROGRESS_STAGES["import"][0])),
                         cancel_event=self.cancel_event)
                 self.mobile_summary = mobile_adb.summarize(export_dir)
                 n_mob = sum(len(b.get("devices") or [])
@@ -588,6 +730,7 @@ class EgoOneClickExportWorker(QThread):
             has_analysis = bool(collected.get("app") or collected.get("firmware"))
             if self.auto_import and has_analysis:
                 self.status.emit("导入 EGO Courier 并对齐分析中…")
+                self.progress.emit(PROGRESS_STAGES["import"][0])
                 imp = sftp_pull.import_pulled(export_dir)
                 sid = (imp.get("session") or {}).get("id")
                 if sid:
@@ -1158,6 +1301,8 @@ class DeviceTab(QWidget):
         fr.setSpacing(6)
         # 统一控件高度，避免下拉框与时间框对不齐
         CTRL_H = 30
+        # 任务进度行（进度条 + 三个按钮）同高：34px 与 QSS 里 #taskProgress 的高度一致
+        ROW_H = 34
         self.cmb_filter = QComboBox()
         self.cmb_filter.setFixedHeight(CTRL_H)
         fr.addWidget(self.cmb_filter)
@@ -1246,23 +1391,29 @@ class DeviceTab(QWidget):
 
 
         # --- 任务进度 + 执行按钮（同一行：进度条居左，按钮靠右） ---
+        # 进度条与三个按钮同高（ROW_H），文字垂直居中由 QSS 的 padding 保证；
+        # 宽度弹性铺满左侧，与按钮基线对齐。工作线程的进度一律经 _progress_ui 节流。
         self.progress = QProgressBar()
+        self.progress.setObjectName("taskProgress")
         self.progress.setRange(0, 100)
+        self.progress.setTextVisible(True)
+        self.progress.setFormat("%p%")
+        self.progress.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.progress.setValue(0)
-        self.progress.setFixedHeight(34)
+        self._progress_ui = _ThrottledProgress(self.progress)
         self.btn_export = QPushButton("开始一键导出")
         self.btn_export.setProperty("role", "primary")
-        self.btn_export.setMinimumHeight(34)
         self.btn_export.clicked.connect(self._start_export)
         self.btn_pack = QPushButton("打包导出")
-        self.btn_pack.setMinimumHeight(34)
         self.btn_pack.clicked.connect(self._start_pack)
         self.btn_stop = QPushButton("取消任务")
         self.btn_stop.setProperty("role", "stop")
-        self.btn_stop.setMinimumHeight(34)
         self.btn_stop.setEnabled(False)
         self.btn_stop.clicked.connect(self._stop)
+        for w in (self.progress, self.btn_export, self.btn_pack, self.btn_stop):
+            w.setFixedHeight(ROW_H)
         pr_btn = QHBoxLayout()
+        pr_btn.setSpacing(8)
         pr_btn.addWidget(self.progress, 1)
         pr_btn.addWidget(self.btn_export)
         pr_btn.addWidget(self.btn_pack)
@@ -1649,7 +1800,7 @@ class DeviceTab(QWidget):
         if not self._precheck_firmware(keys):
             return
 
-        self.progress.setValue(0)
+        self._reset_progress()
         self.btn_export.setEnabled(False)
         self.btn_pack.setEnabled(False)
         self.btn_stop.setEnabled(True)
@@ -1666,7 +1817,7 @@ class DeviceTab(QWidget):
             sdk_port=relay_config.ORBBEC_SDK_PORT,
             sdk_root=self._current_sdk_root(),
             mobile_serials=mobile_serials)
-        self._export_worker.progress.connect(self.progress.setValue)
+        self._export_worker.progress.connect(self._progress_ui.set_value)
         self._export_worker.status.connect(self._append)
         self._export_worker.done.connect(self._on_export_done)
         self._export_worker.cancelled.connect(self._on_export_cancelled)
@@ -1774,8 +1925,13 @@ class DeviceTab(QWidget):
         self.edit_range_end.setDateTime(QDateTime.currentDateTime())
         self._update_pack_counts()
 
-    def _on_export_cancelled(self):
+    def _reset_progress(self):
+        """任务开始/取消时把进度条清零，同时丢掉节流缓存（否则旧任务的高值会顶住新任务）。"""
         self.progress.setValue(0)
+        self._progress_ui.reset()
+
+    def _on_export_cancelled(self):
+        self._reset_progress()
         self._append("一键导出已取消")
         self.log("一键导出已取消")
 
@@ -2073,7 +2229,7 @@ class DeviceTab(QWidget):
         if not self._precheck_firmware(keys):
             return
 
-        self.progress.setValue(0)
+        self._reset_progress()
         self.btn_pack.setEnabled(False)
         self.btn_export.setEnabled(False)
         self.btn_stop.setEnabled(True)
@@ -2086,7 +2242,7 @@ class DeviceTab(QWidget):
             device_host=self.edit_ip.text().strip(),
             sdk_port=relay_config.ORBBEC_SDK_PORT,
             sdk_root=self._current_sdk_root())
-        self._pack_worker.progress.connect(self.progress.setValue)
+        self._pack_worker.progress.connect(self._progress_ui.set_value)
         self._pack_worker.status.connect(self._append)
         self._pack_worker.done.connect(self._on_pack_done)
         self._pack_worker.cancelled.connect(self._on_pack_cancelled)
@@ -2117,7 +2273,7 @@ class DeviceTab(QWidget):
         self.log(f"本地日志打包失败: {err}")
 
     def _on_pack_cancelled(self):
-        self.progress.setValue(0)
+        self._reset_progress()
         self._append("打包已取消")
         self.log("本地日志打包已取消")
 
@@ -2145,7 +2301,7 @@ class DeviceTab(QWidget):
             self.log("已请求取消本地日志打包")
         elif self._dp_worker and self._dp_worker.isRunning():
             self._dp_worker.cancel()
-            self.progress.setValue(0)
+            self._reset_progress()
             self.btn_stop.setEnabled(False)
             self._append("已请求取消 SSH 拉取任务")
             self.log("已取消 SSH 拉取任务")

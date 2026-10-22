@@ -43,7 +43,7 @@ echo.
 echo  --------------------------------------------------------------
 echo   [X] Python was not found on this computer.
 echo.
-echo   EGO Courier desktop needs Python 3.12 to run.
+echo   EGO Courier desktop needs Python 3.10 - 3.12 to run.
 echo.
 echo   1. Open https://www.python.org/downloads/release/python-31210/
 echo      and download "Windows installer (64-bit)".

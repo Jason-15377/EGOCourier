@@ -148,11 +148,23 @@ class TestFilterFirmwarePull(unittest.TestCase):
         self.assertTrue(within)
         self.assertEqual(kept, ["a.log"])
 
-    def test_pull_outside_window_dropped(self):
-        pulled = _ts(2026, 10, 10, 13, 0, 0)
-        kept, stamp, within = ep.filter_firmware_pull(
-            ["a.log"], pulled,
+    def test_pull_after_end_is_kept(self):
+        """真实场景：出问题 → 调时间段 → 点导出，拉取时刻必然晚于 end（远超 2 秒）。
+
+        固件日志是设备端当前全量快照，只要开始时刻在窗口内就应保留；修复前这里
+        整批被剔除，表现为"明明在时间段内导出，firmware 却是空的"。
+        """
+        kept, _stamp, within = ep.filter_firmware_pull(
+            ["a.log"], _ts(2026, 10, 10, 15, 30, 0),
             start=_ts(2026, 10, 10, 0, 0, 0), end=_ts(2026, 10, 10, 12, 0, 0))
+        self.assertTrue(within)
+        self.assertEqual(kept, ["a.log"])
+
+    def test_pull_before_start_dropped(self):
+        """窗口起点晚于拉取时刻：固件日志里没有那段时间的内容，仍应剔除。"""
+        kept, _stamp, within = ep.filter_firmware_pull(
+            ["a.log"], _ts(2026, 10, 10, 8, 0, 0),
+            start=_ts(2026, 10, 10, 9, 0, 0), end=_ts(2026, 10, 10, 12, 0, 0))
         self.assertFalse(within)
         self.assertEqual(kept, [])
 
