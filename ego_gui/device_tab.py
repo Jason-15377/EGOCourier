@@ -153,11 +153,15 @@ class DeviceExportWorker(QThread):
             files = []
             if self.remote_dirs:
                 self.status.emit(f"连接 {self.user}@{self.host} 拉取远端日志…")
+                t0 = time.monotonic()
                 files = sftp_pull.pull_logs(self.host, self.user, self.pwd,
                                             self.remote_dirs, run_dir,
                                             zip_first=self.zip_first,
                                             progress_cb=self._cb)
-                self.status.emit(f"远端日志拉取完成：{len(files)} 个文件")
+                got_bytes = sum(os.path.getsize(f) for f in files if os.path.isfile(f))
+                self.status.emit(f"远端日志拉取完成：{len(files)} 个文件，"
+                                 f"{_human_size(got_bytes)}，耗时 "
+                                 f"{_fmt_dur(time.monotonic() - t0)}")
             sid, report_path = None, ""
             if self.auto_import and files:
                 self.status.emit("导入 EGO Courier 并对齐分析中…")
@@ -187,6 +191,12 @@ class DeviceExportWorker(QThread):
             self.progress.emit(100)
             self.done.emit(sid, report_path)
         except Exception as e:  # noqa: BLE001
+            import traceback as _tb
+            try:
+                _diag(self.local, "SSH/SFTP 导出失败："
+                      f"{type(e).__name__}: {e}\n{_tb.format_exc()}")
+            except Exception:  # noqa: BLE001
+                pass
             self.failed.emit(str(e))
 
 
@@ -247,7 +257,10 @@ class EvLogPackWorker(QThread):
                 puller.status.connect(self.status.emit)
                 puller.progress.connect(self.progress.emit)
                 puller.cancel_event = self.cancel_event
+                _t0 = time.monotonic()
                 paths = puller._pull_firmware(fw_root, pull_at, orbbec_sdk, config)
+                self.status.emit(f"固件日志拉取结束：{len(paths)} 个文件，耗时 "
+                                 f"{_fmt_dur(time.monotonic() - _t0)}")
                 if paths:
                     external["firmware"] = list(paths)
             self.status.emit("收集并筛选日志…")
@@ -268,17 +281,20 @@ class EvLogPackWorker(QThread):
                 end=self.stage_kwargs.get("end"),
                 progress_cb=lambda pct: self.progress.emit(pack_cb(pct)),
                 should_cancel=self._want_cancel)
-            self.status.emit(f"打包完成：{zip_path}")
+            self.status.emit(f"打包完成：{zip_path}"
+                             f"（{_human_size(os.path.getsize(zip_path))}）")
 
             sid, report_path = None, ""
             has_analysis = bool(collected.get("app") or collected.get("firmware"))
             if self.auto_import and has_analysis:
                 self.status.emit("导入 EGO Courier 并对齐分析中…")
                 from ego_relay import sftp_pull, export as export_mod, db
+                _t0 = time.monotonic()
                 imp = sftp_pull.import_pulled(work)
                 sid = (imp.get("session") or {}).get("id")
                 if sid:
-                    self.status.emit(f"导入完成：会话 #{sid}（对齐 + 四类异常检测）")
+                    self.status.emit(f"导入完成：会话 #{sid}（对齐 + 四类异常检测），"
+                                     f"导入耗时 {_fmt_dur(time.monotonic() - _t0)}")
                     if self.auto_report:
                         self.status.emit("自动生成 HTML 报告…")
                         s = db.get_session(sid)
@@ -300,6 +316,12 @@ class EvLogPackWorker(QThread):
             self.status.emit("打包已取消")
             self.cancelled.emit()
         except Exception as e:  # noqa: BLE001
+            import traceback as _tb
+            try:
+                _diag(self.out_dir, "打包导出失败："
+                      f"{type(e).__name__}: {e}\n{_tb.format_exc()}")
+            except Exception:  # noqa: BLE001
+                pass
             self.failed.emit(str(e))
         finally:
             shutil.rmtree(work, ignore_errors=True)
@@ -346,13 +368,23 @@ def _firmware_error_hint(err) -> str:
     return f"固件日志导出失败：{err}"
 
 
+def _safe_leaf(name: str) -> str:
+    """目录名清洗：去掉 Windows 非法字符与首尾的点/空格。"""
+    cleaned = "".join("_" if c in '<>:"/\\|?*' or ord(c) < 32 else c for c in name)
+    return cleaned.strip(" .") or "device"
+
+
 def _pull_firmware_from_device(fw_root, at, sdk_root, orbbec_sdk, config,
                                status=None, progress=None, cancel_event=None,
                                device_host="", port=None, prefer_ip="") -> list:
     """从**所有已连接设备**各拉一份固件日志，返回 [(绝对路径, 相对 rel)]。
 
-    磁盘结构：fw_root/<设备名>/<拉取时刻>/<设备侧原文件名>
-    rel   结构：<设备名>/<拉取时刻>/<文件名>        ← 与磁盘严格一致
+    磁盘结构：fw_root/<设备名_序列号>/<拉取时刻>/<设备侧原文件名>
+    rel   结构：<设备名_序列号>/<拉取时刻>/<文件名>   ← 与磁盘严格一致
+
+    目录名必须带序列号：EGOViewer 的"设备名"经常重复（两台 UMI Finger、固件的
+    EGO-4B 甚至没有型号名）。只按设备名建目录时，多台设备的产物会挤进同一层，
+    现场表现为"导出的三份固件日志内容完全一样"。
 
     实现要点：SDK 回调只能指定一个输出目录，无法按"设备/时刻"两级组织，因此先拉到
     _staging，再逐文件 move 到目标位置。这样同时解决"rel 与磁盘不符"和"同一目录
@@ -369,6 +401,11 @@ def _pull_firmware_from_device(fw_root, at, sdk_root, orbbec_sdk, config,
 
     emit = status or (lambda _t: None)
     prog = progress or (lambda _p: None)
+
+    def label_of(info, leaf):
+        return " · ".join(p for p in (info.get("name"), info.get("serial"),
+                                      info.get("connection") or "") if p) or leaf
+
     pull_name = datetime.fromtimestamp(at).strftime("%Y%m%d-%H%M%S")
     emit("通过 Orbbec SDK 从设备实时拉取固件日志（与 EGOViewer「导出日志」一致）…"
          "（保持设备连接）")
@@ -398,7 +435,13 @@ def _pull_firmware_from_device(fw_root, at, sdk_root, orbbec_sdk, config,
     out = []
     try:
         for folder, info in result.get("ok", {}).items():
-            dest_dir = os.path.join(fw_root, folder, pull_name)
+            # 目录名带序列号：SDK 侧的 folder 现在就是「设备名_序列号」，这里再
+            # 兜一层，保证同型号多台设备的日志永远不会落到同一个目录里。
+            serial = (info.get("serial") or "").strip()
+            leaf = folder
+            if serial and serial not in leaf:
+                leaf = _safe_leaf(f"{folder}_{serial}")
+            dest_dir = os.path.join(fw_root, leaf, pull_name)
             os.makedirs(dest_dir, exist_ok=True)
             for p in info.get("paths", []):
                 base = os.path.basename(p)
@@ -409,8 +452,8 @@ def _pull_firmware_from_device(fw_root, at, sdk_root, orbbec_sdk, config,
                     base = f"{stem}_{int(at)}{ext}"
                     dest = os.path.join(dest_dir, base)
                 shutil.move(p, dest)
-                out.append((dest, f"{folder}/{pull_name}/{base}"))
-            emit(f"设备 {folder}：{len(info.get('paths', []))} 个文件")
+                out.append((dest, f"{leaf}/{pull_name}/{base}"))
+            emit(f"设备 {label_of(info, leaf)}：{len(info.get('paths', []))} 个文件")
     finally:
         shutil.rmtree(stage_root, ignore_errors=True)
 
@@ -562,6 +605,47 @@ class _ThrottledProgress(QObject):
 
 
 # ---------------------------------------------------------------------------
+# 导出阶段的耗时记录：写到 <输出根>/export_diag_<时间戳>.log
+#
+# 「导出很慢 / 导出失败」在新电脑上几乎无法事后判断卡在哪一步（固件拉取的静默
+# 收尾最长 30 s、压缩包下载按字节推进、导入要解析大日志）。这些行同时进界面
+# 运行日志框，现场只要把这个文件发回来就能定位。
+# ---------------------------------------------------------------------------
+def _diag(log_dir, text) -> None:
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        from datetime import datetime
+        with open(os.path.join(log_dir, "export_diag.log"), "a",
+                  encoding="utf-8") as fh:
+            fh.write(f"{datetime.now():%Y-%m-%d %H:%M:%S}  {text}\n")
+    except Exception:  # noqa: BLE001 —— 诊断日志写不进去不能影响导出本身
+        pass
+
+
+def _human_size(n) -> str:
+    try:
+        v = float(n or 0)
+    except (TypeError, ValueError):
+        return "-"
+    for unit in ("B", "KB", "MB", "GB"):
+        if v < 1024 or unit == "GB":
+            return f"{v:.1f}{unit}" if unit != "B" else f"{int(v)}B"
+        v /= 1024.0
+    return f"{v:.1f}GB"
+
+
+def _fmt_dur(sec) -> str:
+    sec = max(0.0, float(sec or 0))
+    if sec < 60:
+        return f"{sec:.1f}s"
+    m, s = divmod(int(sec), 60)
+    if m < 60:
+        return f"{m}m{s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h{m:02d}m"
+
+
+# ---------------------------------------------------------------------------
 # 一键导出后台线程：识别 EGOViewer 根目录 → 全新时间戳目录收集所选分类日志 → 导入分析 + 报告
 #   每次都在输出目录下新建 EGO_export_<时间戳>/，从源目录现拉最新日志，不复用本地旧日志。
 #   app/sdk 按当前筛选方式（时间段 / 手动勾选）筛选后收集。
@@ -634,16 +718,35 @@ class EgoOneClickExportWorker(QThread):
             return datetime.fromtimestamp(v).strftime("%Y-%m-%d %H:%M:%S") if v else "不限"
         return f"{_f(start)} ～ {_f(end)}"
 
+    def _diag(self, text):
+        """同时记录耗时/规模到界面日志与 <输出根>/export_diag.log。"""
+        self.status.emit(text)
+        _diag(self.out_dir, text)
+
     def run(self):
         from ego_relay import (orbbec_sdk, export as export_mod, db, config,
                                sftp_pull)
         from ego_relay import mobile_adb as mobile_adb_mod
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         export_dir = os.path.join(self.out_dir, f"EGO_export_{ts}")
+        clock = {"t": time.monotonic()}
         try:
             if any(k not in ("firmware", "mobile") for k in self.keys):
                 self.status.emit(f"识别 EGOViewer 根目录：{self.root}")
             os.makedirs(export_dir, exist_ok=True)
+            self._diag(
+                f"开始导出 keys={','.join(self.keys)}"
+                + (f" 设备IP={self.device_host}" if self.device_host else "")
+                + f" SDK={self.sdk_root or '(未指定)'}")
+            self._diag(f"输出根目录 {self.out_dir}"
+                       f"（本次目录 {os.path.basename(export_dir)}）")
+            try:
+                import shutil as _sh
+                usage = _sh.disk_usage(self.out_dir)
+                self._diag(f"输出盘剩余 {_human_size(usage.free)}"
+                           f" / 总 {_human_size(usage.total)}")
+            except Exception:  # noqa: BLE001
+                pass
             collected = {}
             # 固件日志只导一份：勾了手机日志时，固件日志由手机（Wi-Fi 连设备）提供，
             # 不再从电脑 USB 重复拉一遍；只有没勾手机日志时才走 Orbbec SDK 直连拉取。
@@ -656,7 +759,13 @@ class EgoOneClickExportWorker(QThread):
                     raise evlog_pack.OperationCancelled("操作已取消")
                 pull_at = time.time()
                 fw_root = os.path.join(export_dir, "firmware")
+                clock["t"] = time.monotonic()
                 fw_items = self._pull_firmware(fw_root, pull_at, orbbec_sdk, config)
+                fw_bytes = sum(os.path.getsize(p) for p, _r in fw_items
+                               if os.path.exists(p))
+                self._diag(f"固件日志拉取结束：{len(fw_items)} 个文件，"
+                           f"{_human_size(fw_bytes)}，耗时 "
+                           f"{_fmt_dur(time.monotonic() - clock['t'])}")
                 if fw_items:
                     collected["firmware"] = [
                         {"abs": p, "rel": rel, "from_name": True}
@@ -669,12 +778,17 @@ class EgoOneClickExportWorker(QThread):
             app_sdk = [k for k in self.keys if k not in ("firmware", "mobile")]
             if app_sdk:
                 self.status.emit("收集 app/SDK 日志…")
+                clock["t"] = time.monotonic()
                 _staged, c = evlog_pack.stage(
                     self.root, export_dir, app_sdk,
                     progress_cb=lambda pct: self.progress.emit(_stage_map("stage", pct)),
                     should_cancel=self._want_cancel,
                     **self.stage_kwargs)
                 collected.update(c)
+                self._diag("本机日志收集结束："
+                           + "、".join(f"{k} {len(v)} 个"
+                                       for k, v in collected.items())
+                           + f"，耗时 {_fmt_dur(time.monotonic() - clock['t'])}")
             # 手机日志：与固件日志同一次导出，落到 <导出目录>/mobile/<机型>/，原样搬运
             if "mobile" in self.keys and self.mobile_serials:
                 if self._want_cancel():
@@ -687,6 +801,7 @@ class EgoOneClickExportWorker(QThread):
                         "未找到 adb，请安装 Android platform-tools 并加入 PATH")
                 # 单台手机的内部进度（导出包/sdk/固件）按台数平摊到 mobile 段
                 n_ph = len(self.mobile_serials)
+                clock["t"] = time.monotonic()
                 for i, serial in enumerate(self.mobile_serials):
                     self.status.emit(f"[{i + 1}/{n_ph}] 拉取手机 {serial} 的日志…")
                     self.progress.emit(
@@ -704,7 +819,8 @@ class EgoOneClickExportWorker(QThread):
                 n_mob = sum(len(b.get("devices") or [])
                             for ph in self.mobile_summary.get("phones", [])
                             for b in ph.get("bundles", []))
-                self.status.emit(f"手机日志：{n_mob} 个设备分组")
+                self._diag(f"手机日志拉取结束：{n_mob} 个设备分组，耗时 "
+                           f"{_fmt_dur(time.monotonic() - clock['t'])}")
             n = sum(len(v) for v in collected.values())
             has_mobile = bool(
                 self.mobile_summary and any(
@@ -731,10 +847,13 @@ class EgoOneClickExportWorker(QThread):
             if self.auto_import and has_analysis:
                 self.status.emit("导入 EGO Courier 并对齐分析中…")
                 self.progress.emit(PROGRESS_STAGES["import"][0])
+                clock["t"] = time.monotonic()
                 imp = sftp_pull.import_pulled(export_dir)
                 sid = (imp.get("session") or {}).get("id")
                 if sid:
                     self.status.emit(f"导入完成：会话 #{sid}（对齐 + 四类异常检测）")
+                    self._diag(f"导入分析结束：会话 #{sid}，耗时 "
+                               f"{_fmt_dur(time.monotonic() - clock['t'])}")
                     if self.auto_report:
                         self.status.emit("自动生成 HTML 报告…")
                         s = db.get_session(sid)
@@ -756,6 +875,14 @@ class EgoOneClickExportWorker(QThread):
             self.status.emit("一键导出已取消")
             self.cancelled.emit()
         except Exception as e:  # noqa: BLE001
+            # 失败时把阶段耗时和完整堆栈一起落盘：弹窗只有一句 str(e)，
+            # 现场（另一台电脑）没有控制台，看不到是哪一步抛的。
+            import traceback as _tb
+            self._diag(f"导出失败：{type(e).__name__}: {e}")
+            try:
+                _diag(self.out_dir, "堆栈：\n" + _tb.format_exc())
+            except Exception:  # noqa: BLE001
+                pass
             self.failed.emit(str(e))
 
 
@@ -1221,8 +1348,10 @@ class DeviceTab(QWidget):
         self.cmb_ev_root.setToolTip("自动检测到的 EGOViewer 安装目录，可手动切换")
         self.cmb_ev_root.currentIndexChanged.connect(self._update_pack_counts)
         rhl.addWidget(self.cmb_ev_root, 1)
-        btn_rescan = QPushButton("重新检测")
-        btn_rescan.setToolTip("重新扫描常见安装路径下的 EGOViewer 目录")
+        btn_rescan = QPushButton("重新检查")
+        btn_rescan.setToolTip(
+            "全盘扫描形如 EGOViewer_v2.0.x 的安装目录（含各盘符深层工具目录），"
+            "按版本号与构建时间从新到旧列出，并自动选中最新版本")
         # 只有用户主动点击才弹提示；启动时的自动检测保持静默
         btn_rescan.clicked.connect(lambda: self._rescan_ev_roots(interactive=True))
         btn_browse_root = QPushButton("浏览…")
@@ -1941,11 +2070,17 @@ class DeviceTab(QWidget):
         self.btn_stop.setEnabled(False)
 
     def _rescan_ev_roots(self, interactive: bool = False):
-        """重新扫描本机 EGOViewer 安装目录。
+        """重新扫描本机 EGOViewer 安装目录（含全盘按 EGOViewer_vXXXX 目录名查找）。
 
-        interactive=True 表示用户在界面上主动点了「重新检测」：此时检测不到要弹窗
-        并列出扫描过的位置，否则"点了没反应"等于坏了。__init__ 里调用时保持默认
-        False，启动过程不能弹窗打断用户。
+        interactive=True 表示用户在界面上主动点了「重新检测」：此时要弹窗列出结果，
+        否则"点了没反应"等于坏了。__init__ 里调用时保持默认 False，启动过程不能
+        弹窗打断用户。
+
+        选中规则：
+          · 用户以前手动挑过的目录仍然保留选择（手动指定优先）；
+          · 否则**自动选中版本最高（同版本按构建时间最新）的那一个**——现场问题
+            就是"重新检查后仍旧是旧版本"，所以新版本必须默认被选中，而不是靠
+            下拉框的第一项碰巧排对。
         """
         try:
             roots = evlog_pack.find_ego_viewer_roots()
@@ -1974,23 +2109,34 @@ class DeviceTab(QWidget):
         self._update_pack_counts()
 
         if roots:
-            self.log(f"检测到 {len(roots)} 个 EGOViewer 安装目录：" + "；".join(roots))
+            latest = roots[0]
+            self.log(f"检测到 {len(roots)} 个 EGOViewer 安装目录（已按版本从新到旧排序）：")
+            for i, rt in enumerate(roots, 1):
+                tag = "  ← 最新，已选中" if (i == 1 and self._current_ev_root() == rt) else ""
+                self.log(f"  {i}. {rt}{tag}")
+            if self._current_ev_root() != latest:
+                self.log(f"当前选中的不是最新版本，最新为：{latest}"
+                         "（如需改用最新版本，请在下拉框中选择）")
+            if interactive:
+                n_old = max(0, len(roots) - 1)
+                QMessageBox.information(
+                    self, "检测完成",
+                    f"共找到 {len(roots)} 个 EGOViewer 安装目录，已按版本从新到旧排序。\n\n"
+                    f"最新版本：\n  {latest}\n\n"
+                    f"当前选中：\n  {self._current_ev_root() or '(未选中)'}"
+                    + (f"\n\n另有 {n_old} 个较旧版本，可在下拉框切换。" if n_old else ""))
             return
         self._append("未自动检测到 EGOViewer 安装目录，可点「浏览…」手动指定")
         self.log("未自动检测到本机 EGOViewer 安装目录")
         if not interactive:
             return
-        try:
-            searched = evlog_pack._candidate_search_roots()
-        except Exception:  # noqa: BLE001
-            searched = []
-        shown = "\n  ".join(searched[:12]) + ("\n  …" if len(searched) > 12 else "")
+        set_scan = os.environ.get("EGO_VIEWER_SCAN_BUDGET_S", "25")
         QMessageBox.warning(
             self, "未检测到 EGOViewer",
-            "已在下列位置扫描（含其下两层子目录），均未找到 EGOViewer 安装目录：\n  "
-            + (shown or "（无）")
-            + "\n\n请点「浏览…」选择 EGOViewer 安装根目录（含 EGOViewer.exe 的那一层），"
-              "\n或设置环境变量 EGO_VIEWER_ROOT 指向该目录。")
+            "已扫描本机所有本地磁盘（深度 6 层，跳过 Windows/Temp 等系统目录，"
+            f"单次上限 {set_scan} 秒），仍未找到名字形如 EGOViewer_v2.0.x 的安装目录。\n\n"
+            "请点「浏览…」选择 EGOViewer 安装根目录（含 EGOViewer.exe 的那一层），"
+            "\n或设置环境变量 EGO_VIEWER_ROOT 指向该目录。")
 
     def _pick_ev_root(self):
         d = QFileDialog.getExistingDirectory(self, "选择 EGOViewer 安装根目录")

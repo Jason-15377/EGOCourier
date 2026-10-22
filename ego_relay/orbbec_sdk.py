@@ -484,20 +484,23 @@ def export_all_firmware_logs(root_dir: str, sdk_root: str = "",
             for d in skipped))
 
     port = int(prefer_port or config.ORBBEC_SDK_PORT or 8090)
-    # 同名设备加序列号后缀区分
-    name_counts = {}
-    for d in devices:
-        name_counts[d.get("name") or "device"] = name_counts.get(d.get("name") or "device", 0) + 1
+    # 设备目录名必须全局唯一：EGOViewer 的"设备名"经常重复（两台都叫 UMI Finger，
+    # 固件上报的 EGO-4B 甚至没有型号名）。只用设备名会让后一台把前一台的产物
+    # 覆盖/混在一起，用户看到"三份日志一模一样"。序列号才唯一，故一律带上它。
     ok, errors = {}, []
     total = len(devices)
     for n, dev in enumerate(devices):
         if cancel_event is not None and cancel_event.is_set():
             raise OrbbecSdkError("固件日志导出已取消", kind="canceled")
-        base = dev.get("name") or "device"
-        if name_counts.get(dev.get("name") or "device", 0) > 1 and dev.get("serial"):
-            base = f"{base}_{dev['serial']}"
-        folder = _safe_folder(base)
-        label = " · ".join(p for p in (dev.get("name"), dev.get("serial"),
+        name = (dev.get("name") or "").strip() or "device"
+        serial = (dev.get("serial") or "").strip()
+        folder = _safe_folder(f"{name}_{serial}" if serial else name)
+        taken = {_safe_folder(k) for k in ok} | {
+            _safe_folder(f"{e.get('name') or 'device'}_{e.get('serial') or ''}".strip("_"))
+            for e in errors}
+        if folder in taken:
+            folder = _safe_folder(f"{folder}_{dev.get('index', n)}")
+        label = " · ".join(p for p in (dev.get("name"), serial or "(无序列号)",
                                        dev.get("connection")) if p)
         if note_cb:
             note_cb(f"[{n + 1}/{total}] 拉取设备固件日志：{label} → {folder}")
@@ -505,8 +508,9 @@ def export_all_firmware_logs(root_dir: str, sdk_root: str = "",
             paths = export_firmware_logs(
                 os.path.join(root_dir, folder), sdk_root=sdk_root,
                 device_index=int(dev.get("index", 0)),
-                # 网络枚举到的设备带上 IP：export_firmware_logs 会按 IP 精确匹配，
-                # 避免设备列表顺序变化时按 index 选错设备。USB 设备 IP 为空，行为不变。
+                # 序列号一路传下去精确选设备（枚举顺序会漂移，index 不可靠）；
+                # 网络枚举到的设备再带上 IP 兜底。USB 设备 IP 为空，行为不变。
+                device_serial=serial,
                 device_ip=(dev.get("ip") or ""), device_port=port,
                 timeout_s=timeout_s, cancel_event=cancel_event,
                 firmware_idle_s=firmware_idle_s, note_cb=note_cb,
@@ -555,6 +559,7 @@ def export_firmware_logs(output_dir: str, sdk_root: str = "", device_index: int 
                          progress_cb: Optional[Callable[[int, str], None]] = None,
                          cancel_event: Optional[threading.Event] = None,
                          device_ip: str = "", device_port: int = 8090,
+                         device_serial: str = "",
                          firmware_idle_s: float = 30.0,
                          note_cb: Optional[Callable[[str], None]] = None) -> list[str]:
     """Export firmware logs from a network device (enumeration-first, official-style).
@@ -563,6 +568,15 @@ def export_firmware_logs(output_dir: str, sdk_root: str = "", device_index: int 
     默认 30 秒：EGO-4B（固件 1.1.1）传 5 MB 级大文件时，包间隔实测可超过 20 秒，
     15 秒会在传到一半时误判为结束（现场表现为 .log.1 正好停在 5242880 字节）。
     note_cb：收尾/异常时的附加说明回调（如“设备未上报完成”“文件可能不完整”）。
+
+    device_serial / device_index 的优先级：
+      1) device_serial 与枚举到的设备序列号**完全相等** → 用那一条；
+      2) device_ip 与枚举到的 IP 相等 → 用那一条；
+      3) 都不命中 → 才按 device_index 取列表第 N 条（旧式调用）。
+    多设备场景必须把序列号一路传下来：枚举顺序在多次 query 之间并不稳定，只按
+    index 选会让三台设备都拉到同一台（现场表现为"三份固件日志内容完全一样"）。
+    命中设备后还会用描述的序列号复核，不符直接报错，绝不把 A 设备的日志写进
+    B 设备的目录。
     """
     dll = find_sdk_dll(sdk_root)
     if not dll:
@@ -585,25 +599,26 @@ def export_firmware_logs(output_dir: str, sdk_root: str = "", device_index: int 
         device = None
         device_list = None
         picked_index = -1          # 最终选中的设备在列表中的下标（用于日志说明）
-        if device_ip:
+        want_serial = (device_serial or "").strip().lower()
+        if want_serial or device_ip:
             device_list = b.call(b.ob_query_device_list, ctx)
             count = int(b.call(b.ob_device_list_get_count, device_list))
-            target = device_ip.strip().lower()
+            target_ip = (device_ip or "").strip().lower()
             match = -1
             for i in range(count):
-                try:
-                    ip_raw = b.call(b.ob_device_list_get_device_ip_address, device_list, i)
-                    ip = (ip_raw or b"").decode("utf-8", "replace").strip().lower()
-                except OrbbecSdkError:
-                    ip = ""
-                if ip and ip == target:
+                info = _device_info(b, device_list, i)
+                # 序列号优先：它才是设备的唯一身份，index / IP 都会随枚举漂移
+                if want_serial and (info.get("serial") or "").strip().lower() == want_serial:
                     match = i
                     break
+                if (match < 0 and target_ip
+                        and (info.get("ip") or "").strip().lower() == target_ip):
+                    match = i          # IP 命中先记下，继续找有没有序列号更准的
             if match >= 0:
                 device = b.call(b.ob_device_list_get_device, device_list, match)
                 picked_index = match
         if device is None:
-            # 未匹配到指定 IP 或未指定 IP：回退到手动建链（仍支持旧式调用方）
+            # 未匹配到指定设备或未指定：回退到手动建链（仍支持旧式调用方）
             if device_ip and not device_list:
                 device = b.call(b.ob_create_net_device, ctx, device_ip.encode("utf-8"), int(device_port))
             else:
@@ -616,8 +631,18 @@ def export_firmware_logs(output_dir: str, sdk_root: str = "", device_index: int 
                 picked_index = int(device_index)
         if not device:
             raise OrbbecSdkError("SDK 获取设备句柄失败", kind="no_device")
-        if note_cb and device_list is not None:
-            note_cb(f"已选中设备 {_describe_device(b, device_list, picked_index)}")
+        described = (_describe_device(b, device_list, picked_index)
+                     if device_list is not None else "")
+        # 复核：指定了序列号就必须真的是那台。宁可这一台报错，也不能把别的设备的
+        # 日志写进它的目录（否则用户会拿错日志去分析，且完全看不出来）。
+        if want_serial and picked_index >= 0:
+            got = (_device_info(b, device_list, picked_index).get("serial") or "").strip().lower()
+            if got != want_serial:
+                raise OrbbecSdkError(
+                    f"选中的设备序列号不符：期望 {device_serial}，实际 {got or '(空)'}",
+                    kind="other")
+        if note_cb and described:
+            note_cb(f"已选中设备 {described}")
 
         CALLBACK = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_int,
                                     ctypes.c_void_p, ctypes.c_uint32,

@@ -251,7 +251,7 @@ class TestMultiDeviceExport(unittest.TestCase):
         calls = []
 
         def fake_single(out_dir, **kw):
-            calls.append((out_dir, kw.get("device_index")))
+            calls.append((out_dir, kw.get("device_index"), kw.get("device_serial")))
             os.makedirs(out_dir, exist_ok=True)
             p = os.path.join(out_dir, "orbbec.log")
             with open(p, "w", encoding="utf-8") as fh:
@@ -265,13 +265,16 @@ class TestMultiDeviceExport(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp:
                 res = sdk.export_all_firmware_logs(tmp)
                 folders = sorted(os.listdir(tmp))
-                self.assertIn("EGO-4B", folders)
-                # 两台同名 UMI 用序列号区分，互不覆盖
+                # 目录名一律带序列号：只按设备名建目录会让同型号多台机挤在一起
+                self.assertIn("EGO-4B_AZLV961004Y", folders)
                 self.assertIn("UMI Finger_OBC168DEFAULT", folders)
                 self.assertIn("UMI Finger_BF8M960008D", folders)
                 self.assertEqual(len(res["ok"]), 3)
                 self.assertEqual(res["errors"], [])
                 self.assertEqual(len(calls), 3)
+                # 序列号必须一路传到单台导出：只按 index 选会让多台都拉到同一台
+                self.assertEqual([c[2] for c in calls],
+                                 ["AZLV961004Y", "OBC168DEFAULT", "BF8M960008D"])
         finally:
             sdk.list_devices, sdk.export_firmware_logs = orig_list, orig_single
 

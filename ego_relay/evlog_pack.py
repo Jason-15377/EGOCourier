@@ -104,26 +104,188 @@ def _matches_any(fn: str, cat: dict) -> bool:
     return _matches(fn, cat["pattern"])
 
 
+# 安装包目录名里的版本与构建时间，例如：
+#   EGOViewer_v2.0.18_202610202306_1addb669_win_x64
+#   EGOViewer_v2.0.17_202610152231_6f55ace5_win_x64
+# 版本号是"谁更新"的第一依据；同一版本内再比构建时间（_202610202306 这种 12 位）。
+_EGO_VER_RE = re.compile(r"v(\d+)\.(\d+)(?:\.(\d+))?", re.IGNORECASE)
+_EGO_BUILD_RE = re.compile(r"(?:^|[_\-. ])(20\d{10})(?:[_\-. ]|$)")
+
+
 def _version_key(name: str) -> tuple:
-    """从 EGOViewer 目录名解析版本号（形如 v2.0.15），用于按版本排序。
+    """从 EGOViewer 目录名解析版本号（形如 v2.0.15 / V2.0.18），用于按版本排序。
 
     解析失败时返回 (0,0,0)，使无法识别版本的目录排在最后。
     """
-    m = re.search(r"v(\d+)\.(\d+)\.(\d+)", name)
+    m = _EGO_VER_RE.search(name)
     if m:
-        return tuple(int(x) for x in m.groups())
+        return tuple(int(x or 0) for x in m.groups())
     return (0, 0, 0)
 
 
-def find_ego_viewer_roots() -> list:
-    """定位本机所有 EGOViewer 安装根目录，按版本从新到旧排序。
+def _build_key(name: str, path: str = "") -> float:
+    """同一版本号的先后依据：优先目录名里的构建时间，退回落盘 mtime。"""
+    m = _EGO_BUILD_RE.search(name)
+    if m:
+        try:
+            return float(m.group(1))
+        except ValueError:
+            pass
+    try:
+        return float(os.stat(path or name).st_mtime)
+    except OSError:
+        return 0.0
 
-    搜索根见 `_candidate_search_roots`：不再依赖写死的路径列表，换盘 / 重装到
-    其它目录 / 换一台机器都能自动发现。
 
-    两种命中方式：
-      1) 父目录下存在子目录，且该子目录满足 is_ego_viewer_root（最常见）；
-      2) 父目录本身就是一个安装根（用户把安装目录直接填进了自定义列表）。
+# 安装包目录名末尾的提交哈希（如 _1addb669_win_x64 里的 1addb669）。
+_EGO_HASH_RE = re.compile(r"(?:^|[_\-. ])([0-9a-f]{6,40})(?=[_\-.]|$)", re.IGNORECASE)
+
+
+def _dir_token(name: str) -> str:
+    """去掉版本号/构建时间/提交哈希后的目录名，用作同版本同构建时的稳定区分。
+
+    不直接按目录名排序：名字里那段哈希没有先后含义，按字母序排会让"备份副本"
+    压过真正的新安装。优先按"去掉可变 token 后的名字"，最后才用全名兜底。
+    """
+    out = _EGO_VER_RE.sub("", name)
+    out = _EGO_BUILD_RE.sub("", out)
+    out = _EGO_HASH_RE.sub("", out)
+    return out.strip("_-. ").lower() or name.lower()
+
+
+def _sort_roots(paths) -> list:
+    """按「版本号 → 构建时间 → 名字」从新到旧排序，最新版本永远排第一。"""
+    def key(p):
+        base = os.path.basename(p)
+        return (_version_key(base), _build_key(base, p), _dir_token(base))
+    return sorted(paths, key=key, reverse=True)
+
+
+def _scan_budget_s() -> float:
+    """单次全盘扫描最多花多久（秒）。
+
+    现场反馈：EGOViewer 装在非常规目录（例如别的盘、多级工具目录下）时，按固定
+    候选目录扫不到的次数太多。改为全盘扫描后必须给自己设上限——网络盘/大容量
+    机械盘上百毫秒一层的 stat 会把启动拖死。超时即返回已找到的结果（新的在前
+    不会因为截断而丢最新版本），并把实际耗时打进日志。
+    """
+    try:
+        v = float(os.environ.get("EGO_VIEWER_SCAN_BUDGET_S", "") or 25)
+    except ValueError:
+        v = 25.0
+    return max(2.0, min(v, 300.0))
+
+
+# 全盘扫描时明确跳过的系统目录：里面不会有 EGOViewer 安装包，却极耗时间。
+_SKIP_DIR_NAMES = {
+    "windows", "winsxs", "windows.old", "system32", "syswow64", "sxs",
+    "recovery", "boot", "$recycle.bin", "system volume information",
+    "node_modules", "site-packages", "__pycache__", ".git", ".cache",
+    "appdata", "$windows.~bt", "$windows.~ws", "msocache", "perflogs",
+    "temp", "tmp", "downloads", "程序调试", "pytest-of",
+}
+
+# 路径里出现这些片段说明是临时/备份/回收站里的残留，不能当成"正在用的安装"。
+# 全盘扫描很容易刨出测试留下的 EGOViewer_v*_x、安装包的临时解压目录——它们
+# 名字里也有版本号，混进列表会把真正的新版本顶掉/干扰选择。
+_SKIP_PATH_PARTS = (
+    "\\appdata\\local\\temp\\", "\\local settings\\temp\\",
+    "\\pytest-of", "\\recycle", "\\$recycle.bin", "\\windows\\", "\\backup",
+    "\\备份", "\\副本", "\\copy of",
+)
+
+
+def _is_plausible_install_path(path: str) -> bool:
+    low = path.lower().replace("/", "\\")
+    if any(part in low for part in _SKIP_PATH_PARTS):
+        return False
+    return not any(f"\\{name}\\" in low for name in _SKIP_DIR_NAMES)
+
+
+def _drive_letters() -> list:
+    """本机可用的盘符（Windows 用 GetLogicalDrives 位图，其它平台只扫 /）。"""
+    if os.name != "nt":
+        return [os.sep]
+    letters = []
+    try:
+        import ctypes
+        mask = ctypes.windll.kernel32.GetLogicalDrives()
+    except Exception:  # noqa: BLE001
+        mask = 0
+        for c in "CDEFGHIJKLMNOPQRSTUVWXYZ":
+            if os.path.isdir(f"{c}:\\"):
+                mask |= 1 << (ord(c) - ord("A"))
+    for i in range(26):
+        if not (mask >> i) & 1:
+            continue
+        d = f"{chr(ord('A') + i)}:\\"
+        # DRIVE_FIXED=3（U 盘/光驱/网络盘不扫：慢且几乎不会是安装位置）
+        try:
+            import ctypes
+            if ctypes.windll.kernel32.GetDriveTypeW(ctypes.c_wchar_p(d)) != 3:
+                continue
+        except Exception:  # noqa: BLE001
+            pass
+        letters.append(d)
+    return letters
+
+
+def _scan_disk(deadline: float, max_depth: int = 6) -> list:
+    """全盘广度优先查找名字以 EGOViewer_vXXX 开头的目录（不校验内容，由调用方判）。
+
+    只认目录名，不做任何文件读取，因此单层成本就是一次 scandir。深度限制 6 级
+    足够覆盖 <盘>\\Soft&tools\\软件工具\\EGOViewer_v... 这类布局，又不会被
+    Windows 深不见底的系统目录拖住。云同步/网络盘通过 _SKIP_DIR_NAMES 与盘符
+    类型过滤掉。
+    """
+    import collections
+    import time as _time
+
+    found, seen = [], set()
+    queue = collections.deque((d, 0) for d in _drive_letters())
+    while queue:
+        if _time.monotonic() > deadline:
+            break
+        base, depth = queue.popleft()
+        key = os.path.normcase(base)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            entries = list(os.scandir(base))
+        except OSError:
+            continue
+        for e in entries:
+            try:
+                if not e.is_dir():
+                    continue
+            except OSError:
+                continue
+            low = e.name.lower()
+            if low.startswith(_EGO_DIR_PREFIXES) and _version_key(e.name) != (0, 0, 0):
+                found.append(e.path)
+                continue          # 命中的安装目录不再往里钻（避免备用/备份目录刷屏）
+            if depth + 1 >= max_depth or low in _SKIP_DIR_NAMES:
+                continue
+            if low.startswith("$") or low.endswith("~1"):
+                continue
+            queue.append((e.path, depth + 1))
+    return found
+
+
+def find_ego_viewer_roots(deep: bool = True) -> list:
+    """定位本机所有 EGOViewer 安装根目录，按「版本号 → 构建时间」从新到旧排序。
+
+    两步走：
+      1) 候选目录浅扫（`_candidate_search_roots`，含环境变量/配置/本工具所在盘），
+         成本极低，正常安装都能在这一步命中；
+      2) deep=True 时再做一次**全盘**扫描，只按目录名找 EGOViewer_vXXXX*。客户机上
+         安装位置五花八门（D:\\、两层工具目录、U 盘拷来解压的目录），固定候选目录
+         的漏检率太高，现场表现为"点了重新检测还是老版本"。
+         全盘扫描有时间上限（EGO_VIEWER_SCAN_BUDGET_S，默认 25 s）。
+
+    命中方式：子目录满足 is_ego_viewer_root，或父目录本身就是安装根（用户把
+    安装目录直接填进自定义列表）。
     """
     out = []
     seen = set()
@@ -144,10 +306,16 @@ def find_ego_viewer_roots() -> list:
                 if is_ego_viewer_root(sub):
                     _push(sub)
 
-    out.sort(
-        key=lambda p: (_version_key(os.path.basename(p)), os.path.basename(p)),
-        reverse=True)
-    return out
+    if deep:
+        import time as _time
+        deadline = _time.monotonic() + _scan_budget_s()
+        for path in _sort_roots(_scan_disk(deadline)):
+            if not _is_plausible_install_path(path):
+                continue
+            if is_ego_viewer_root(path):
+                _push(path)
+
+    return _sort_roots(out)
 
 
 def _subdirs(base: str, depth: int, prefixes=()) -> list:

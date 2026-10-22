@@ -95,6 +95,44 @@ QProgressBar#taskProgress { background:#ffffff; border:1px solid #d1d5db;
   font-size:12px; }
 QProgressBar#taskProgress::chunk { background:#3b82f6; border-radius:3px;
   margin:3px; }
+/* ---- 勾选框 / 单选框 ----
+   之前整套 QSS 里完全没有 QCheckBox 规则：文字颜色靠祖先的 color:#222 生效，
+   但方框本身按"面板绘制"处理，系统一开深色模式就变成深色/近黑的小方块，
+   在白色卡片上格外突兀。这里把背景、边框、勾选态颜色全部写死。 */
+QCheckBox, QRadioButton { background:transparent; color:#222; spacing:6px; }
+QCheckBox::indicator, QRadioButton::indicator { width:14px; height:14px;
+  background:#ffffff; border:1px solid #9ca3af; }
+QCheckBox::indicator { border-radius:3px; }
+QRadioButton::indicator { border-radius:7px; }
+QCheckBox::indicator:hover, QRadioButton::indicator:hover { border-color:#2563eb; }
+/* 勾选态用"蓝底 + 内嵌白点"表达，不引用 Qt 内部图片资源：
+   Qt 版本之间资源路径不保证一致，引用失败会得到空框（什么都看不到）。 */
+QCheckBox::indicator:checked { background:#2563eb; border:1px solid #2563eb;
+  image:none; }
+QRadioButton::indicator:checked { background:#ffffff; border:4px solid #2563eb; }
+QCheckBox::indicator:disabled, QRadioButton::indicator:disabled {
+  background:#f3f4f6; border-color:#d1d5db; }
+QCheckBox:disabled, QRadioButton:disabled { color:#9ca3af; }
+/* ---- 下拉列表弹层 / 右键菜单 / 提示条 ----
+   弹层是独立顶层窗口，不继承主窗口的浅色面版，深色系统下会整块变黑
+   （白字、深底），与旁边的输入框完全不是一套配色。 */
+QComboBox QAbstractItemView { background:#ffffff; color:#222;
+  border:1px solid #d1d5db; border-radius:4px; outline:0;
+  selection-background-color:#dbeafe; selection-color:#1e3a8a; }
+QComboBox::drop-down { border:none; width:18px; }
+QMenu { background:#ffffff; color:#222; border:1px solid #d1d5db; padding:4px; }
+QMenu::item { padding:5px 22px 5px 12px; border-radius:4px; }
+QMenu::item:selected { background:#dbeafe; color:#1e3a8a; }
+QMenu::separator { height:1px; background:#e5e7eb; margin:4px 6px; }
+QToolTip { background:#ffffff; color:#222; border:1px solid #d1d5db; padding:4px 6px; }
+/* ---- 滚动条：不写规则时深色系统会给深色槽与滑块 ---- */
+QScrollBar:vertical { background:#f5f6f8; width:10px; margin:0; }
+QScrollBar:horizontal { background:#f5f6f8; height:10px; margin:0; }
+QScrollBar::handle:vertical, QScrollBar::handle:horizontal {
+  background:#c7cbd1; border-radius:5px; min-height:24px; min-width:24px; }
+QScrollBar::handle:hover { background:#a8aeb6; }
+QScrollBar::add-line, QScrollBar::sub-line { width:0; height:0; }
+QScrollBar::add-page, QScrollBar::sub-page { background:transparent; }
 """
 
 # 顶部 Tab 顺序持久化：存到 data/tab_order.json（与 thresholds.json 同一目录），

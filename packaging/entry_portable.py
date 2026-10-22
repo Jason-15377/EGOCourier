@@ -17,6 +17,32 @@ from __future__ import annotations
 
 import os
 import sys
+import traceback
+
+
+def _install_excepthook() -> None:
+    """未捕获异常写进 <exe 同级>/log/export_debug.log。
+
+    现场（另一台电脑）没有控制台，导出线程里抛的异常只剩一句弹窗文案，
+    重启后连那句话也没了。启动器本身不写运行日志，这里补一条持久记录。
+    """
+    def _hook(exc_type, exc, tb):
+        try:
+            here = os.path.dirname(os.path.abspath(sys.executable))
+            log_dir = os.path.join(here, "log")
+            os.makedirs(log_dir, exist_ok=True)
+            from datetime import datetime
+            with open(os.path.join(log_dir, "export_debug.log"), "a",
+                      encoding="utf-8") as fh:
+                fh.write(f"===== {datetime.now():%Y-%m-%d %H:%M:%S} "
+                         f"未捕获异常 =====\n")
+                traceback.print_exception(exc_type, exc, tb, file=fh)
+                fh.write("\n")
+        except Exception:
+            pass
+        sys.__excepthook__(exc_type, exc, tb)
+
+    sys.excepthook = _hook
 
 
 def _roots() -> list[str]:
@@ -87,6 +113,7 @@ def _preflight() -> str:
 
 def main() -> int:
     _install_roots()
+    _install_excepthook()
 
     problem = _preflight()
     if problem:
