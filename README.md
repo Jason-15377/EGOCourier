@@ -261,6 +261,10 @@ python tests/smoke_gui.py                     :: 桌面 GUI 冒烟（offscreen�
 
 测试：新增 `tests/test_theme_pinning.py`（浅色钉死 + QSS 覆盖度）；`test_fixes_v106.py` 增加版本排序与多设备隔离用例；全套 **167** 项通过。
 
+发布包：`EGO_Courier_portable_v1.0.8_win64.zip`（Python 3.12.10 + PyInstaller 6.22.3 构建，
+84 580 707 字节）。按仓库约定 `dist/` 与 `*.zip` 不入库，通过 Release 附件分发。
+安装前请注意：便携版必须**整目录解压**，只替换 exe 会因缺少 `runtime/` 而启动失败。
+
 ### v1.0.7（2026-10-21）缺陷修复
 
 | 编号 | 现象 | 修复 |
