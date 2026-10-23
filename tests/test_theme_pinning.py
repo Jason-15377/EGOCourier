@@ -61,9 +61,19 @@ class TestStylesheetCoversNativeWidgets(unittest.TestCase):
     def setUp(self):
         self.style = app_mod.STYLE
 
-    def test_checkbox_has_explicit_rules(self):
-        self.assertIn("QCheckBox::indicator", self.style)
-        self.assertIn("#ffffff", self.style.split("QCheckBox::indicator")[1][:200])
+    def test_checkbox_declares_background_but_keeps_native_indicator(self):
+        """勾选框要有显式 background（摆脱深色调色板），但不能自定义 indicator。
+
+        v1.0.8 曾把 `QCheckBox::indicator:checked` 写成蓝底实心块，勾上之后整个
+        方框变成一片蓝色填充，与系统原生外观（白底 + 深色 ✓）差得很明显。
+        方框交给系统绘制，才能保持用户熟悉的样式。
+        """
+        self.assertIn("QCheckBox", self.style)
+        self.assertIn("QCheckBox, QRadioButton { background:transparent;",
+                      self.style)
+        self.assertNotIn("QCheckBox::indicator", self.style,
+                         "不要自定义勾选框的方框：会把它画成实心填充块")
+        self.assertNotIn("QRadioButton::indicator", self.style)
 
     def test_combo_popup_and_menu_are_styled(self):
         self.assertIn("QComboBox QAbstractItemView", self.style)

@@ -96,22 +96,12 @@ QProgressBar#taskProgress { background:#ffffff; border:1px solid #d1d5db;
 QProgressBar#taskProgress::chunk { background:#3b82f6; border-radius:3px;
   margin:3px; }
 /* ---- 勾选框 / 单选框 ----
-   之前整套 QSS 里完全没有 QCheckBox 规则：文字颜色靠祖先的 color:#222 生效，
-   但方框本身按"面板绘制"处理，系统一开深色模式就变成深色/近黑的小方块，
-   在白色卡片上格外突兀。这里把背景、边框、勾选态颜色全部写死。 */
-QCheckBox, QRadioButton { background:transparent; color:#222; spacing:6px; }
-QCheckBox::indicator, QRadioButton::indicator { width:14px; height:14px;
-  background:#ffffff; border:1px solid #9ca3af; }
-QCheckBox::indicator { border-radius:3px; }
-QRadioButton::indicator { border-radius:7px; }
-QCheckBox::indicator:hover, QRadioButton::indicator:hover { border-color:#2563eb; }
-/* 勾选态用"蓝底 + 内嵌白点"表达，不引用 Qt 内部图片资源：
-   Qt 版本之间资源路径不保证一致，引用失败会得到空框（什么都看不到）。 */
-QCheckBox::indicator:checked { background:#2563eb; border:1px solid #2563eb;
-  image:none; }
-QRadioButton::indicator:checked { background:#ffffff; border:4px solid #2563eb; }
-QCheckBox::indicator:disabled, QRadioButton::indicator:disabled {
-  background:#f3f4f6; border-color:#d1d5db; }
+   方框与勾选标记一律交给系统原生绘制（Windows 上是圆角白底 + 深色 ✓），
+   不自定义 indicator：v1.0.8 曾把勾选态写成蓝底实心块，勾上之后整个方框变成
+   一块蓝色填充，与原生外观差得很明显，已恢复。
+   这里只写 background/color：Qt 认为"背景来自面板"时会改用系统深色调色板画
+   indicator，显式声明背景后即按本套浅色配色绘制，深色模式下也不会发黑。 */
+QCheckBox, QRadioButton { background:transparent; color:#222; }
 QCheckBox:disabled, QRadioButton:disabled { color:#9ca3af; }
 /* ---- 下拉列表弹层 / 右键菜单 / 提示条 ----
    弹层是独立顶层窗口，不继承主窗口的浅色面版，深色系统下会整块变黑
