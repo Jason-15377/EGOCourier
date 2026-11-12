@@ -33,6 +33,10 @@ def _meta(session: Dict) -> Dict:
     return m or {}
 
 
+# 手机设备分组（展开后平铺）：<机型>/<SN>-<YYYYMMDD_HHMMSS>[-<hash>]/…
+_MOBILE_GROUP_RE = re.compile(r"^[^/]+/[A-Za-z0-9]+-\d{8}_\d{6}")
+
+
 def source_kind(session: Dict) -> str:
     """判断这批日志从哪来：手机日志 / 电脑端导出 / 分析目录。"""
     path = (session.get("source_path") or "").replace("\\", "/")
@@ -40,7 +44,11 @@ def source_kind(session: Dict) -> str:
     rels = [str(f.get("file") or "").replace("\\", "/") for f in files]
     if "/mobile/" in path + "/" or any(r.startswith("mobile/") for r in rels):
         return "手机日志"
-    if "app-logs-zips" in path or "ego-logs-app-" in path:
+    if "app-logs-zips" in path or "ego-logs-app-" in path or "egoviewer-logs-" in path:
+        return "手机日志"
+    # 平铺展开后的手机设备分组：<机型>/<SN>-<时间戳>-<hash>/…（<机型> 不是 app/sdk 这类）
+    if any(_MOBILE_GROUP_RE.match(r) and not r.startswith(("app/", "sdk/", "firmware/"))
+           for r in rels):
         return "手机日志"
     if _EGO_EXPORT_RE.match(os.path.basename(path.rstrip("/")) or ""):
         return "电脑端导出"

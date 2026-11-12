@@ -14,13 +14,14 @@ from PySide6.QtWidgets import (
 
 from ego_relay import config
 
+from . import resources
 from .device_tab import DeviceTab
 from .sessions_tab import SessionsTab
 from .analysis_tab import AnalysisTab
 from .trace_tab import TraceTab
 
 # 全局 QSS：与 Web 版统一（浅色顶栏 + 蓝色激活下划线 + 浅灰内容区 + 白色表格，简洁干净）
-STYLE = """
+QSS_TEMPLATE = """
 QWidget { font-family:"Microsoft YaHei","Segoe UI"; font-size:13px; color:#222; }
 QMainWindow, QWidget { background:#f5f6f8; }
 /* ---- 顶栏 Tab（浅色，蓝色激活下划线，去掉黑色） ---- */
@@ -96,13 +97,25 @@ QProgressBar#taskProgress { background:#ffffff; border:1px solid #d1d5db;
 QProgressBar#taskProgress::chunk { background:#3b82f6; border-radius:3px;
   margin:3px; }
 /* ---- 勾选框 / 单选框 ----
-   方框与勾选标记一律交给系统原生绘制（Windows 上是圆角白底 + 深色 ✓），
-   不自定义 indicator：v1.0.8 曾把勾选态写成蓝底实心块，勾上之后整个方框变成
-   一块蓝色填充，与原生外观差得很明显，已恢复。
-   这里只写 background/color：Qt 认为"背景来自面板"时会改用系统深色调色板画
-   indicator，显式声明背景后即按本套浅色配色绘制，深色模式下也不会发黑。 */
+   Windows 11 原生样式（PySide6 6.8 起的默认）根本不画方框：未勾选只有一条
+   浅灰细线，勾上后是一个近黑的 ✓，白卡片上几乎看不出"这里有个可以勾的框"。
+   上一版把这套原生绘制直接交给系统，形状问题没解决，只是不再变蓝。
+   这里显式画出标准方框：白底 + 1px 灰边 + 3px 圆角，勾选时在框内画深色 ✓。
+   勾选图案是随包分发的 assets/check.svg（构建时由 _build_style 注入绝对路径），
+   不引用 Qt 内部图片资源——那类路径跨版本不保证存在，失败会得到空框。 */
 QCheckBox, QRadioButton { background:transparent; color:#222; }
 QCheckBox:disabled, QRadioButton:disabled { color:#9ca3af; }
+QCheckBox::indicator, QRadioButton::indicator { width:14px; height:14px;
+  background:#ffffff; border:1px solid #a1a8b3; }
+QCheckBox::indicator { border-radius:3px; }
+QRadioButton::indicator { border-radius:8px; }
+QCheckBox::indicator:hover, QRadioButton::indicator:hover {
+  border-color:#2563eb; }
+QCheckBox::indicator:checked { image:url("__CHECK_SVG__"); }
+QRadioButton::indicator:checked { background:#2563eb; border:4px solid #ffffff;
+  outline:1px solid #2563eb; }
+QCheckBox::indicator:disabled, QRadioButton::indicator:disabled {
+  background:#f3f4f6; border-color:#d1d5db; }
 /* ---- 下拉列表弹层 / 右键菜单 / 提示条 ----
    弹层是独立顶层窗口，不继承主窗口的浅色面版，深色系统下会整块变黑
    （白字、深底），与旁边的输入框完全不是一套配色。 */
@@ -124,6 +137,21 @@ QScrollBar::handle:hover { background:#a8aeb6; }
 QScrollBar::add-line, QScrollBar::sub-line { width:0; height:0; }
 QScrollBar::add-page, QScrollBar::sub-page { background:transparent; }
 """
+
+
+def _build_style() -> str:
+    """把勾选图案的绝对路径填进 QSS。
+
+    QSS 的 url() 只认磁盘文件，不认 data: URI —— 实测
+    ``image:url("data:image/svg+xml;base64,...")`` 静默失效，勾选态与未勾选态
+    渲染完全一样。所以 ✓ 作为 assets/check.svg 随包分发，这里换成绝对路径。
+    路径统一用正斜杠：Windows 的反斜杠在 QSS 里会被当作转义字符。
+    """
+    path = resources.asset_path("check.svg").replace("\\", "/")
+    return QSS_TEMPLATE.replace("__CHECK_SVG__", path)
+
+
+STYLE = _build_style()
 
 # 顶部 Tab 顺序持久化：存到 data/tab_order.json（与 thresholds.json 同一目录），
 # 下次启动按用户自定义顺序恢复。格式为按显示顺序排列的 Tab 标题列表。

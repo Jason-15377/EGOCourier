@@ -109,47 +109,49 @@ class TestAppLogCandidates(unittest.TestCase):
 class TestFirmwareLayout(unittest.TestCase):
     """T5：磁盘结构与 rel 必须一致，且重复导出不覆盖。"""
 
-    def test_timestamp_dir_under_device(self):
+    def test_device_dir_by_serial_no_timestamp_layer(self):
+        """设备目录直接用序列号，不再套拉取时刻层（同一设备始终同一目录）。"""
         def fake(root_dir, **kw):
             # SDK 只认一个输出目录；模拟它按设备建子目录写文件
-            dev_dir = os.path.join(root_dir, "EGOPro")
+            dev_dir = os.path.join(root_dir, "EGOPro_AZL9861004V")
             _touch(os.path.join(dev_dir, "orbbec_2026-10-21.log"), "fw")
-            return {"ok": {"EGOPro": {"name": "EGOPro", "paths": [
-                os.path.join(dev_dir, "orbbec_2026-10-21.log")]}},
+            return {"ok": {"EGOPro_AZL9861004V": {
+                "name": "EGOPro", "serial": "AZL9861004V", "paths": [
+                    os.path.join(dev_dir, "orbbec_2026-10-21.log")]}},
                 "errors": [], "skipped": []}
 
         import ego_gui.device_tab as dt
         at = 1770000000.0
         with mock.patch.object(sdk, "export_all_firmware_logs", fake):
             with tempfile.TemporaryDirectory() as tmp:
-                fw_root = os.path.join(tmp, "firmware")
+                fw_root = os.path.join(tmp, "out")
                 out = dt._pull_firmware_from_device(
                     fw_root, at, "", sdk, object())
-                stamp = __import__("datetime").datetime.fromtimestamp(at) \
-                    .strftime("%Y%m%d-%H%M%S")
                 self.assertEqual(len(out), 1)
                 abs_path, rel = out[0]
-                self.assertEqual(rel, f"EGOPro/{stamp}/orbbec_2026-10-21.log")
+                # 电脑端固件统一收进 firmware/<SN>/，rel 与磁盘严格一致
+                self.assertEqual(rel, "firmware/AZL9861004V/orbbec_2026-10-21.log")
                 self.assertEqual(
                     os.path.normcase(abs_path),
                     os.path.normcase(os.path.join(
-                        fw_root, "EGOPro", stamp, "orbbec_2026-10-21.log")))
+                        fw_root, "firmware", "AZL9861004V", "orbbec_2026-10-21.log")))
 
     def test_same_second_does_not_overwrite(self):
-        """同一时刻（同一秒）对同一目录导出两次：两份文件都要留下。"""
+        """同一设备导出两次：两份文件都要留下（同名加后缀，不覆盖）。"""
         import ego_gui.device_tab as dt
         at = 1770000000.0
 
         def fake(root_dir, **kw):
-            dev_dir = os.path.join(root_dir, "EGOPro")
+            dev_dir = os.path.join(root_dir, "EGOPro_AZLV961004Y")
             _touch(os.path.join(dev_dir, "orbbec.log"), "fw")
-            return {"ok": {"EGOPro": {"name": "EGOPro", "paths": [
-                os.path.join(dev_dir, "orbbec.log")]}},
+            return {"ok": {"EGOPro_AZLV961004Y": {
+                "name": "EGOPro", "serial": "AZLV961004Y", "paths": [
+                    os.path.join(dev_dir, "orbbec.log")]}},
                 "errors": [], "skipped": []}
 
         with mock.patch.object(sdk, "export_all_firmware_logs", fake):
             with tempfile.TemporaryDirectory() as tmp:
-                fw_root = os.path.join(tmp, "firmware")
+                fw_root = os.path.join(tmp, "out")
                 first = dt._pull_firmware_from_device(fw_root, at, "", sdk, object())
                 second = dt._pull_firmware_from_device(fw_root, at, "", sdk, object())
                 self.assertEqual(len(first), 1)
@@ -285,7 +287,9 @@ class TestMultiDeviceFirmwareIsolation(unittest.TestCase):
                 fw_root = os.path.join(tmp, "firmware")
                 out = dt._pull_firmware_from_device(fw_root, at, "", sdk, object())
                 rels = sorted(rel for _p, rel in out)
-                stamps = len({rel.split("/")[0] for rel in rels})
+                # rel 形如 firmware/<SN>/<文件名>：第 0 段是固定归集目录，
+                # 第 1 段才是设备序列号
+                stamps = len({rel.split("/")[1] for rel in rels})
                 self.assertEqual(stamps, 2, rels)
                 self.assertTrue(all("BF8M960008D" in r or "OBC168DEFAULT" in r
                                     for r in rels), rels)
@@ -311,6 +315,32 @@ class TestErrorKinds(unittest.TestCase):
         self.assertEqual(sdk._classify_error("Firmware log already disabled"),
                          "fw_disabled")
         self.assertEqual(sdk._classify_error("boom"), "other")
+
+    def test_unresponsive_is_classified(self):
+        """现场原始串：设备回了 0 字节，SDK 报 IO 失败。"""
+        msg = ("Request failed, statusCode: 8, msg: Device response size(0) < "
+               "response header size(10), propertyId: 1000")
+        self.assertEqual(sdk._classify_error(msg), "unresponsive")
+
+    def test_only_transient_errors_are_retried(self):
+        """抖动类（回包 0 / 超时）可重试；稳定状态（占用/日志关闭/缺 DLL）不重试。"""
+        io_msg = ("Request failed, statusCode: 8, msg: Device response size(0) < "
+                  "response header size(10), propertyId: 1000")
+        self.assertTrue(sdk.is_transient_error(io_msg))
+        self.assertTrue(sdk.is_transient_error(sdk.OrbbecSdkError("x", kind="timeout")))
+        self.assertFalse(sdk.is_transient_error("device is busy / already open"))
+        self.assertFalse(sdk.is_transient_error("Firmware log already disabled"))
+        self.assertFalse(sdk.is_transient_error(sdk.OrbbecSdkError("x", kind="dll")))
+        self.assertFalse(sdk.is_transient_error("boom"))
+
+    def test_unresponsive_has_actionable_hint(self):
+        """不能只把英文原文丢给用户，要说清怎么排查。"""
+        import ego_gui.device_tab as dt
+        hint = dt._firmware_error_hint(
+            sdk.OrbbecSdkError("statusCode: 8", kind="unresponsive"))
+        self.assertIn("掉线", hint)
+        self.assertIn("重新插拔", hint)
+        self.assertIn("statusCode: 8", hint)   # 原文保留，便于贴给研发
 
     def test_hints_are_distinct(self):
         import ego_gui.device_tab as dt

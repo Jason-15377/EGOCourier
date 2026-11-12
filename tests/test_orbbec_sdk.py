@@ -6,6 +6,12 @@ import pathlib
 import tempfile
 import unittest
 
+# 测试绝不能写真实的设备记忆文件（否则跑一次测试就把假设备记成「常用设备」，
+# 真实导出时会被这些垃圾历史误导）。统一重定向到临时文件。
+from ego_relay import config as _cfg
+_cfg.FIRMWARE_DEVICE_MEMORY = pathlib.Path(
+    tempfile.mkdtemp(prefix="ego_mem_test_")) / "firmware_devices.json"
+
 from ego_relay.orbbec_sdk import (
     FirmwareLogWriter,
     OrbbecSdkError,
@@ -348,29 +354,182 @@ class TestUsbFirstSelection(unittest.TestCase):
                 res = sdk.export_all_firmware_logs(tmp, note_cb=notes.append)
                 self.assertEqual(len(res["skipped"]), 2)
                 # 提示要说明"为什么跳过"，否则用户只会看到设备少了两台
-                self.assertTrue(any("跳过 2 台设备" in n and "非 USB 直连" in n
-                                    for n in notes), notes)
+                self.assertTrue(any("以太网/Wi-Fi 设备不导" in n for n in notes), notes)
         finally:
             sdk.list_devices, sdk.export_firmware_logs = orig_list, orig_single
 
-    def test_prefer_ip_picks_only_that_device(self):
-        """配网后设备只走网络链路：必须能按 IP 精确选中它，而不是被 USB 优先跳过。"""
+    def test_network_devices_are_not_pulled_even_with_prefer_ip(self):
+        """填了配网 IP 也**不**连带拉同网段的以太网设备。
+
+        现场要求：只导电脑 USB 识别到的设备。配网 IP 只影响拉取顺序，不再决定
+        拉几台——同网段里既有自己的从设备、也有别人的设备，无法可靠区分。
+        """
         from ego_relay import orbbec_sdk as sdk
 
         pulled = []
         orig_list, orig_single = sdk.list_devices, sdk.export_firmware_logs
         sdk.list_devices = lambda *a, **k: self.DEVICES
         sdk.export_firmware_logs = lambda out_dir, **kw: (
-            pulled.append((out_dir, kw.get("device_ip"))) or [])
+            pulled.append(kw.get("device_ip")) or [])
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 res = sdk.export_all_firmware_logs(
                     tmp, prefer_ip="192.168.1.101")
-                self.assertEqual(len(res["ok"]), 1, res)
-                self.assertEqual(len(pulled), 1)
-                self.assertEqual(pulled[0][1], "192.168.1.101")
-                # 其余设备（含 USB 直连）都算跳过，并说明原因
-                self.assertEqual(len(res["skipped"]), 4)
+                # 只有 3 台 USB，网络设备全部跳过
+                self.assertEqual(len(res["ok"]), 3, res)
+                self.assertNotIn("192.168.1.101", pulled)
+                self.assertNotIn("192.168.1.102", pulled)
+                self.assertEqual(len(res["skipped"]), 2)
+        finally:
+            sdk.list_devices, sdk.export_firmware_logs = orig_list, orig_single
+
+    def test_max_network_limits_apply_only_to_manual_selection(self):
+        """限额只对手动勾选（或纯网线现场）有意义；自动模式根本没有网络设备。
+
+        自动模式已改为只导 USB，所以历史/延迟排序在自动模式下不再触发——这里
+        验证手动勾选多台以太网设备时仍按 max_network 截断，避免一次拉太多。
+        """
+        from ego_relay import orbbec_sdk as sdk
+        from ego_relay import wifi as wifi_mod
+
+        devices = [
+            {"name": "UMI", "serial": "USB0000001", "connection": "USB2.0",
+             "ip": "0.0.0.0", "index": 0},
+            {"name": "EGOPro", "serial": "NET0000101", "connection": "Ethernet",
+             "ip": "192.168.1.101", "index": 2},
+            {"name": "EGOPro", "serial": "NET0000102", "connection": "Ethernet",
+             "ip": "192.168.1.102", "index": 3},
+            {"name": "UMI", "serial": "NET0000143", "connection": "Ethernet",
+             "ip": "192.168.1.143", "index": 4},
+            {"name": "UMI", "serial": "NET0000145", "connection": "Ethernet",
+             "ip": "192.168.1.145", "index": 5},
+        ]
+        latency = {"192.168.1.143": 2.0, "192.168.1.145": 5.0,
+                   "192.168.1.101": 30.0, "192.168.1.102": 90.0}
+        # NET0000102 历史导出 9 次（最常用），其余无历史
+        memory = {"NET0000102": {"count": 9, "last": "2026-11-09 10:00:00"}}
+        pulled, notes = [], []
+        orig_list, orig_single = sdk.list_devices, sdk.export_firmware_logs
+        orig_ms, orig_mem, orig_rem = (wifi_mod.ping_ms, sdk.load_device_memory,
+                                       sdk.remember_devices)
+        sdk.list_devices = lambda *a, **k: devices
+        sdk.export_firmware_logs = lambda out_dir, **kw: (
+            pulled.append(kw.get("device_ip")) or [])
+        wifi_mod.ping_ms = lambda host, timeout_ms=300: latency.get(host, 1e9)
+        sdk.load_device_memory = lambda: dict(memory)
+        sdk.remember_devices = lambda devs: None      # 不写真实记忆文件
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                sdk.export_all_firmware_logs(
+                    tmp, prefer_ip="192.168.1.101", max_network=3,
+                    only_serials=["NET0000101", "NET0000102",
+                                  "NET0000143", "NET0000145"],
+                    note_cb=notes.append)
+                net = [ip for ip in pulled if ip and ip != "0.0.0.0"]
+                self.assertEqual(len(net), 3, net)
+                # 历史最多的 102 必须入选（哪怕它延迟最慢，90ms）
+                self.assertIn("192.168.1.102", net, "历史次数最多的应优先")
+                # 配网设备 101 保底入选（用户当下在操作的那台）
+                self.assertIn("192.168.1.101", net, "配网设备必须保底")
+                # 最后一个名额给剩余里最快的 143(2ms)
+                self.assertIn("192.168.1.143", net, "剩余名额按延迟给最快的")
+                self.assertNotIn("192.168.1.145", net, "名额已满，5ms 的这台排不上")
+                self.assertTrue(any("按历史优先取 3 台" in n for n in notes), notes)
+        finally:
+            sdk.list_devices, sdk.export_firmware_logs = orig_list, orig_single
+            wifi_mod.ping_ms = orig_ms
+            sdk.load_device_memory, sdk.remember_devices = orig_mem, orig_rem
+
+    def test_manual_only_serials_overrides_auto(self):
+        """手动勾选设备时只导这些，不再走历史/延迟/限额。"""
+        from ego_relay import orbbec_sdk as sdk
+
+        devices = [
+            {"name": "EGOPro", "serial": "WANT0001", "connection": "Ethernet",
+             "ip": "192.168.1.101", "index": 0},
+            {"name": "UMI", "serial": "OTHER001", "connection": "Ethernet",
+             "ip": "192.168.1.143", "index": 1},
+            {"name": "UMI", "serial": "OTHER002", "connection": "Ethernet",
+             "ip": "192.168.1.145", "index": 2},
+        ]
+        pulled = []
+        orig_list, orig_single = sdk.list_devices, sdk.export_firmware_logs
+        orig_rem = sdk.remember_devices
+        sdk.list_devices = lambda *a, **k: devices
+        sdk.export_firmware_logs = lambda out_dir, **kw: (
+            pulled.append(kw.get("device_serial")) or [])
+        sdk.remember_devices = lambda devs: None
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                sdk.export_all_firmware_logs(tmp, only_serials=["WANT0001"])
+                self.assertEqual(pulled, ["WANT0001"], "只拉手动勾选的那台")
+        finally:
+            sdk.list_devices, sdk.export_firmware_logs = orig_list, orig_single
+            sdk.remember_devices = orig_rem
+
+    def test_manual_missing_device_raises(self):
+        """勾选的设备一台都不在线时明确报错，而不是静默导别的。"""
+        from ego_relay import orbbec_sdk as sdk
+
+        orig_list, orig_rem = sdk.list_devices, sdk.remember_devices
+        sdk.list_devices = lambda *a, **k: [
+            {"name": "UMI", "serial": "OTHER001", "connection": "Ethernet",
+             "ip": "192.168.1.143", "index": 0}]
+        sdk.remember_devices = lambda devs: None
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                with self.assertRaises(sdk.OrbbecSdkError):
+                    sdk.export_all_firmware_logs(tmp, only_serials=["GONE0001"])
+        finally:
+            sdk.list_devices = orig_list
+            sdk.remember_devices = orig_rem
+
+    def test_max_network_zero_means_unlimited(self):
+        """max_network=None 表示不限制：手动勾选多台以太网时全部导出。"""
+        from ego_relay import orbbec_sdk as sdk
+        from ego_relay import wifi as wifi_mod
+
+        devices = [d for d in self.DEVICES] + [
+            {"name": "UMI", "serial": "BF7LA6000KF", "connection": "Ethernet",
+             "ip": "192.168.1.143", "index": 7}]
+        pulled = []
+        orig_list, orig_single = sdk.list_devices, sdk.export_firmware_logs
+        orig_ms = wifi_mod.ping_ms
+        orig_mem, orig_rem = sdk.load_device_memory, sdk.remember_devices
+        sdk.list_devices = lambda *a, **k: devices
+        sdk.export_firmware_logs = lambda out_dir, **kw: (
+            pulled.append(kw.get("device_ip")) or [])
+        wifi_mod.ping_ms = lambda host, timeout_ms=300: 10.0
+        sdk.load_device_memory = lambda: {}
+        sdk.remember_devices = lambda devs: None
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                res = sdk.export_all_firmware_logs(
+                    tmp, prefer_ip="192.168.1.101", max_network=None,
+                    only_serials=["AZLR86000FH", "AZL9861004A", "BF7LA6000KF"])
+                self.assertEqual(len(res["ok"]), 3, res["ok"])
+        finally:
+            sdk.list_devices, sdk.export_firmware_logs = orig_list, orig_single
+            wifi_mod.ping_ms = orig_ms
+            sdk.load_device_memory, sdk.remember_devices = orig_mem, orig_rem
+
+    def test_prefer_ip_does_not_pull_other_subnet(self):
+        """跨网段的网络设备（别人的机器）不能被拉走——现在连本网段的也不拉了。"""
+        from ego_relay import orbbec_sdk as sdk
+
+        devices = list(self.DEVICES) + [
+            {"name": "EGOPro", "serial": "OTHER0001", "connection": "Ethernet",
+             "ip": "10.9.82.9", "index": 9}]
+        pulled = []
+        orig_list, orig_single = sdk.list_devices, sdk.export_firmware_logs
+        sdk.list_devices = lambda *a, **k: devices
+        sdk.export_firmware_logs = lambda out_dir, **kw: (
+            pulled.append(kw.get("device_ip")) or [])
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                sdk.export_all_firmware_logs(tmp, prefer_ip="192.168.1.101")
+                self.assertNotIn("10.9.82.9", pulled)
+                self.assertEqual(pulled, ["0.0.0.0"] * 3, "只应导 3 台 USB")
         finally:
             sdk.list_devices, sdk.export_firmware_logs = orig_list, orig_single
 
@@ -390,6 +549,78 @@ class TestUsbFirstSelection(unittest.TestCase):
                 self.assertTrue(any("未找到 IP 10.0.0.99" in n for n in notes), notes)
         finally:
             sdk.list_devices, sdk.export_firmware_logs = orig_list, orig_single
+
+
+class TestTransientRetry(unittest.TestCase):
+    """设备"回了 0 字节 / IO 超时"这类抖动重试一次；稳定失败不重试。
+
+    现场原始错误（EGO_export v1.0.9）：
+        Request failed, statusCode: 8, msg: Device response size(0) <
+        response header size(10), propertyId: 1000
+    实测同一批设备里能导的与导不了的随机分布，重试往往就好了。
+    """
+
+    IO_MSG = ("Request failed, statusCode: 8, msg: Device response size(0) < "
+              "response header size(10), propertyId: 1000")
+
+    DEVICES = [
+        {"name": "UMI", "serial": "USB0000001", "connection": "USB2.0",
+         "ip": "0.0.0.0", "index": 0},
+    ]
+
+    def _run(self, side_effect, delay=0.0):
+        from ego_relay import orbbec_sdk as sdk
+
+        calls, notes = [], []
+        orig = (sdk.list_devices, sdk.export_firmware_logs, sdk.FIRMWARE_RETRY_DELAY_S)
+        sdk.list_devices = lambda *a, **k: list(self.DEVICES)
+
+        def _fake(out_dir, **kw):
+            calls.append(1)
+            return side_effect(len(calls))
+
+        sdk.export_firmware_logs = _fake
+        sdk.FIRMWARE_RETRY_DELAY_S = delay
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                res = sdk.export_all_firmware_logs(tmp, note_cb=notes.append)
+                return res, calls, notes
+        finally:
+            sdk.list_devices, sdk.export_firmware_logs, sdk.FIRMWARE_RETRY_DELAY_S = orig
+
+    def test_unresponsive_is_retried_once_and_succeeds(self):
+        def _side(attempt):
+            if attempt == 1:
+                raise sdk_error(self.IO_MSG)
+            return []
+
+        res, calls, notes = self._run(_side)
+        self.assertEqual(len(calls), 2, "首次失败后应重试一次")
+        self.assertEqual(len(res["errors"]), 0, res["errors"])
+        self.assertEqual(list(res["ok"]), ["UMI_USB0000001"])
+        self.assertTrue(any("重试成功" in n for n in notes), notes)
+
+    def test_retry_only_once(self):
+        def _side(_attempt):
+            raise sdk_error(self.IO_MSG)
+
+        res, calls, notes = self._run(_side)
+        self.assertEqual(len(calls), 2, "只重试一次，不能无限重试")
+        self.assertEqual(len(res["errors"]), 1)
+        self.assertEqual(res["errors"][0]["kind"], "unresponsive")
+
+    def test_stable_error_is_not_retried(self):
+        def _side(_attempt):
+            raise sdk_error("device is busy / already open", kind="busy")
+
+        res, calls, _notes = self._run(_side)
+        self.assertEqual(len(calls), 1, "被占用是稳定状态，不该重试")
+        self.assertEqual(res["errors"][0]["kind"], "busy")
+
+
+def sdk_error(msg, kind="other"):
+    from ego_relay import orbbec_sdk as sdk
+    return sdk.OrbbecSdkError(msg, kind=kind)
 
 
 class TestNoImplicitNetworkExport(unittest.TestCase):
@@ -426,12 +657,16 @@ class TestNoImplicitNetworkExport(unittest.TestCase):
         self.assertEqual(pulled, ["0.0.0.0"] * 3)
         self.assertEqual(len(res["skipped"]), 2)
 
-    def test_stale_ip_from_provisioning_does_not_open_network(self):
-        """框里留着配网 IP、include_network=False：只拉那一台，其余网络设备仍跳过。"""
+    def test_stale_ip_from_provisioning_still_only_usb(self):
+        """框里留着配网 IP 时也只导 USB：同网段网络设备一律不拉。
+
+        这是现场要求「电脑 USB 识别到的设备导出，非 USB 识别的不导出」的回归点。
+        """
         res, pulled = self._pull(include_network=False, prefer_ip="192.168.1.101")
-        self.assertEqual(len(res["ok"]), 1, res["ok"])
-        self.assertEqual(pulled, ["192.168.1.101"])
-        self.assertEqual(len(res["skipped"]), 4)
+        self.assertEqual(len(res["ok"]), 3, res["ok"])
+        self.assertEqual(pulled, ["0.0.0.0"] * 3)
+        self.assertNotIn("192.168.1.101", pulled)
+        self.assertNotIn("192.168.1.102", pulled)
 
     def test_ui_never_requests_network_enumeration(self):
         """UI 的固件拉取路径必须固定 include_network=False。"""

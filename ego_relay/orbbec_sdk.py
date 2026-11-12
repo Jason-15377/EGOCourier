@@ -7,6 +7,7 @@ SSH/SFTP concern and are deliberately not mixed into this module.
 from __future__ import annotations
 
 import ctypes
+import json
 import os
 import sys
 import threading
@@ -28,6 +29,7 @@ class OrbbecSdkError(RuntimeError):
     #: no_device   —— 枚举不到任何设备
     #: busy        —— 设备被其它进程占用（典型：EGOViewer 正在用）
     #: fw_disabled —— 设备端固件日志功能未开启
+    #: unresponsive —— 设备能枚举但读不动（回包 0 字节 / IO 失败，常见于已离线或固件卡死）
     #: timeout     —— 导出超时 / 静默收尾
     #: canceled    —— 用户取消
     #: other       —— 其它
@@ -37,9 +39,24 @@ class OrbbecSdkError(RuntimeError):
         self.kind = kind
 
 
+# 「设备暂时没响应」重试前的等待秒数。太短设备还没恢复，太长会让整轮导出白等；
+# 2 秒足够让一次丢包/设备刚处理完上个请求的抖动过去。
+FIRMWARE_RETRY_DELAY_S = 2.0
+
+
 # SDK 原始错误串里用于识别失败类型的关键字（小写比较）。
 _BUSY_HINTS = ("occup", "in use", "already open", "占用", "device busy", "resource")
 _FWDIS_HINTS = ("firmware log", "already disabled", "disabled")
+# 「枚举得到、却读不动」：设备回了 0 字节（连 10 字节响应头都没有），SDK 归类为 IO。
+# 实测这类错误与具体设备强相关——同一台电脑、同一个 SDK，有的设备能导、有的导不了，
+# EGOViewer 自己的日志里也用同样的串报过 device_enumeration_entry_unavailable，
+# 因此它是设备侧链路/固件问题，不是调用方参数错误。
+_UNRESPONSIVE_HINTS = (
+    "device response size",      # Device response size(0) < response header size(10)
+    "response header size",
+    "unrecoverable_exception",
+    "end_of_stream",
+)
 
 
 def _classify_error(err) -> str:
@@ -51,7 +68,19 @@ def _classify_error(err) -> str:
         return "busy"
     if any(h in low for h in _FWDIS_HINTS):
         return "fw_disabled"
+    if any(h in low for h in _UNRESPONSIVE_HINTS):
+        return "unresponsive"
     return "other"
+
+
+def is_transient_error(err) -> bool:
+    """是否值得重试一次。只对「设备暂时没响应」这类抖动返回 True。
+
+    判定刻意保守：设备被占用（busy）、固件日志关闭（fw_disabled）、缺 DLL
+    （dll）都是稳定状态，重试只会白白多等一轮；只有 IO 无响应 / 超时这种
+    一次性的链路抖动才重试。
+    """
+    return _classify_error(err) in ("unresponsive", "timeout")
 
 
 # OBFwLogPacketState values from ObTypes.h.
@@ -341,6 +370,131 @@ def is_local_connection(dev: dict) -> bool:
     return not conn and (not ip or ip == "0.0.0.0")
 
 
+def _same_device(a: dict, b: dict) -> bool:
+    """两个设备条目是否指同一台设备：优先比序列号，其次比 IP，最后比 dict 相等。"""
+    sa = str(a.get("serial") or "").strip().upper()
+    sb = str(b.get("serial") or "").strip().upper()
+    if sa and sb:
+        return sa == sb
+    ia = str(a.get("ip") or "").strip()
+    ib = str(b.get("ip") or "").strip()
+    if ia and ib and ia != "0.0.0.0":
+        return ia == ib
+    return a == b
+
+
+def _dedupe(devices: list[dict]) -> list[dict]:
+    """按 _same_device 去重，保留首次出现的顺序（dict 不可哈希，不能直接用 set）。"""
+    out: list[dict] = []
+    for d in devices:
+        if not any(_same_device(d, x) for x in out):
+            out.append(d)
+    return out
+
+
+def load_device_memory() -> dict:
+    """读取「导出过的设备」记忆；文件缺失或损坏时返回空字典。
+
+    结构 {SN大写: {"count": 次数, "last": 最后导出时间, "name":..., "ip":...}}。
+    """
+    path = getattr(config, "FIRMWARE_DEVICE_MEMORY", None)
+    if not path:
+        return {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:  # noqa: BLE001 —— 记忆文件坏了不能影响导出
+        return {}
+
+
+def remember_devices(devices) -> None:
+    """把本次成功导出的设备写入记忆（累加次数、更新最后时间）。
+
+    只记录成功拉到的设备，避免「失败一次就把这台算进历史优先」。
+    """
+    path = getattr(config, "FIRMWARE_DEVICE_MEMORY", None)
+    if not path or not devices:
+        return
+    mem = load_device_memory()
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    for d in devices:
+        sn = str(d.get("serial") or "").strip().upper()
+        if not sn:
+            continue
+        rec = mem.get(sn) or {"count": 0}
+        rec["count"] = int(rec.get("count") or 0) + 1
+        rec["last"] = stamp
+        if d.get("name"):
+            rec["name"] = d["name"]
+        if d.get("ip"):
+            rec["ip"] = d["ip"]
+        mem[sn] = rec
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(mem, fh, ensure_ascii=False, indent=2)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _memory_rank(dev: dict, mem: dict) -> tuple:
+    """设备在「历史优先」里的排序键：次数多的在前，其次时间新的在前。"""
+    sn = str(dev.get("serial") or "").strip().upper()
+    rec = mem.get(sn) or {}
+    return (-int(rec.get("count") or 0), str(rec.get("last") or ""))
+
+
+def _closest_devices(devices: list[dict], limit: int, note_cb=None) -> list[dict]:
+    """按 ping 延迟从快到慢取前 limit 台网络设备（近似「离得近」）。
+
+    固件日志拉取单台往往十几秒到一分钟，一网段七八台会把整次导出拖到几分钟。
+    用户要求「以太网优先按最近的 3 台导出」。以太网没有蓝牙 RSSI，只能用往返
+    延迟近似距离；不可达/超时的设备排在最后，只在名额还有剩余时才会被选中。
+    """
+    from . import wifi as wifi_mod
+
+    scored = []
+    for d in devices:
+        ip = (d.get("ip") or "").strip()
+        ms = wifi_mod.ping_ms(ip, timeout_ms=300) if ip else 1e9
+        scored.append((ms, d))
+    scored.sort(key=lambda x: x[0])
+    picked = [d for _ms, d in scored[:limit]]
+    if note_cb:
+        def _label(ms, d):
+            sn = d.get("serial") or d.get("name") or "?"
+            return f"{sn}({'超时' if ms >= 1e6 else f'{ms:.0f}ms'})"
+
+        note_cb(f"以太网设备共 {len(devices)} 台，按延迟取最近 {len(picked)} 台："
+                + "、".join(_label(ms, d) for ms, d in scored[:limit]))
+        if len(devices) > limit:
+            note_cb(f"其余 {len(devices) - limit} 台以太网设备未拉取（已限制为最近 "
+                    f"{limit} 台，避免导出过慢）")
+    return picked
+
+
+def _subnet_of(ip: str) -> str:
+    """返回 IP 的 /24 网段前缀（如 '192.168.1'）；非法或空 IP 返回空串。
+
+    用于「配网 IP 与设备是否同一套网络」的判断：同一 /24 内的网络设备才属于
+    当前这套系统（主设备 + 左右指环等从设备），跨网段的多是别人的机器。
+    """
+    ip = (ip or "").strip()
+    if not ip or ip == "0.0.0.0":
+        return ""
+    parts = ip.split(".")
+    if len(parts) != 4:
+        return ""
+    try:
+        nums = [int(p) for p in parts]
+    except ValueError:
+        return ""
+    if any(n < 0 or n > 255 for n in nums):
+        return ""
+    return ".".join(str(n) for n in nums[:3])
+
+
 def select_devices(devices: list[dict], include_network: bool = False) -> list[dict]:
     """挑选本次要导出的设备：**USB 直连优先**。
 
@@ -429,22 +583,22 @@ def export_all_firmware_logs(root_dir: str, sdk_root: str = "",
                              include_network: bool = False,
                              prefer_ip: str = "",
                              prefer_port: int = 0,
+                             skip_serials=(),
+                             max_network: Optional[int] = None,
+                             only_serials=(),
                              ) -> dict:
-    """从**本机应该导出的设备**各拉一份固件日志，按设备名分目录。
+    """从**本机 USB 直连的设备**各拉一份固件日志，按序列号分目录。
 
-    USB 直连优先：GVCP 网络枚举会把整个局域网里的设备都扫出来（实测本机只有 3 台，
-    却枚举到 5 台以上），因此默认跳过纯网络发现的设备，并在日志里说明跳过了谁。
-    一台 USB 都没有时 select_devices 会自动退回全部设备，所以"只用网线连"的场景
-    不需要靠 include_network 就能导出。
+    只导 USB：GVCP 网络枚举会把整个局域网里所有 Orbbec 设备都扫出来（实测本机插
+    3 台，却枚举到 5 台以上），而以太网/Wi-Fi 上的设备属于谁无法从 SDK 信息判断，
+    靠网段、延迟、历史次数都只能猜，结果时多时少。USB 是物理连接，插了就是本机的。
+    因此自动模式下**非 USB 直连的设备一律不导**，并在日志里说明跳过了谁。
+    一台 USB 都没有（纯网线现场）时退回读取全部设备，避免整批为空。
 
-    include_network=True 仅用于调用方**明确**要求"连网络设备一起导"。它会把局域网里
-    别人机器上的设备也一并导出，因此 UI 不应因为"填了设备 IP"就打开它——要定位
-    单台设备请用 prefer_ip。
+    include_network=True 仅用于调用方**明确**要求"连网络设备一起导"；
+    手动勾选（only_serials）同样是明确指定，此时不受 USB 限制。
 
-    prefer_ip：指定设备的 IP（来自 BLE 配网结果）。命中的设备不受 USB 优先筛选限制
-               （纯网络设备也能拉）；若枚举列表中找不到该 IP，则回退到原来的
-               "USB 优先"挑选逻辑并提示。
-    prefer_port：prefer_ip 对应的 SDK 网络端口，默认取 config.ORBBEC_SDK_PORT。
+    prefer_ip：配网 IP。它只影响拉取顺序（命中设备排最前），不再决定拉几台。
 
     输出结构：<root_dir>/<设备名>/(其本次拉取产物)。同一设备因 USB + 网络重复枚举时
     只拉 USB 那条；同名设备（如两台 EGO-4B）在名称后追加序列号，避免互相覆盖。
@@ -458,31 +612,157 @@ def export_all_firmware_logs(root_dir: str, sdk_root: str = "",
         raise OrbbecSdkError("Orbbec SDK 未发现任何设备，请确认 USB / 网络链路已连接",
                              kind="no_device")
 
-    picked_by_ip = False
-    devices = []
+    # 用户在界面上**手动勾选**了具体设备：只导这些，其余全部跳过。
+    # 这是最高优先级——自动策略（历史优先 / 按延迟）再怎么做也可能猜错，
+    # 让用户直接指定是唯一可靠的兜底。勾了但已离线的设备会提示出来。
+    want = {str(s).strip().upper() for s in (only_serials or ()) if str(s).strip()}
+    if want:
+        manual = [d for d in all_devices
+                  if str(d.get("serial") or "").strip().upper() in want]
+        missing = want - {str(d.get("serial") or "").strip().upper() for d in manual}
+        if note_cb:
+            note_cb("按手动勾选导出设备：" + "、".join(
+                str(d.get("serial") or d.get("name")) for d in manual)
+                if manual else "手动勾选的设备当前都不在线")
+            if missing:
+                note_cb("以下勾选设备未找到（可能已离线）：" + "、".join(sorted(missing)))
+        if not manual:
+            raise OrbbecSdkError(
+                "手动勾选的设备都不在线，请刷新设备列表后重新勾选", kind="no_device")
+        all_devices = manual
+        # 手动模式不走网段筛选，但保留以太网限额与「配网设备优先」：
+        # prefer_ip 只影响排序，不会把没勾的设备带进来（all_devices 已裁好）。
+    elif not any(is_local_connection(d) for d in all_devices):
+        # 一台 USB 都没有：自动模式本来只留 USB，会挑出空集合。这种现场（只用
+        # 网线/Wi-Fi 连）退回老语义——全部设备都导，否则导出结果为空。
+        if note_cb:
+            note_cb("没有检测到 USB 直连设备，改为导出全部可访问设备"
+                    f"（{len(all_devices)} 台）")
+        # 与纯网线现场换位：no_usb 时下面的「只导 USB」分支不能再把设备全剔掉
+        net_only = True
+    else:
+        net_only = False
+
+    # 配网 IP 命中的设备优先拉（排最前）。注意：自动模式只导 USB，网络设备会被
+    # 下面「只导 USB」那步剔除，所以这句话只在它确实入选（USB/手动）时才提示。
+    by_ip: list[dict] = []
     if prefer_ip:
         target_ip = prefer_ip.strip().lower()
         hit = [d for d in all_devices
                if (d.get("ip") or "").strip().lower() == target_ip]
-        if hit:
-            devices = hit
-            picked_by_ip = True
+        if hit and (want or is_local_connection(hit[0])):
+            by_ip = hit
             if note_cb:
-                note_cb(f"按配网 IP 定位设备：{prefer_ip}（{len(hit)} 台）")
-        elif note_cb:
-            note_cb(f"枚举列表中未找到 IP {prefer_ip}，回退到 USB 优先挑选")
+                note_cb(f"配网设备 {prefer_ip} 优先拉取")
+        elif note_cb and not hit:
+            note_cb(f"枚举列表中未找到 IP {prefer_ip}，改为按连接方式挑选")
+
+    # 其余设备的选择策略：**只导本机 USB 直连的设备**。
+    # 现场要求（用户原话）：「电脑 USB 识别到的设备导出，非 USB 识别的设备不导出」。
+    # 理由：以太网/Wi-Fi 上的设备是谁的说不清——GVCP 广播会把整个局域网扫一遍，
+    # 同网段既有自己的从设备，也有别人机器上的设备，靠网段/延迟/历史都猜不准，
+    # 只能是「有时多导了几台，有时漏了」，结果不稳定。USB 是物理连接，插了就是
+    # 本机的，不会有歧义。
+    # 因此：
+    #   · 配网 IP / 网段 / 延迟 / 历史记忆这些网络侧启发式一律不再参与自动挑选；
+    #   · 用户**手动勾选**（only_serials）仍然有效，那是明确指定，不受此限；
+    #   · 一台 USB 都没有时，退回按 include_network 的老语义（默认取全部设备），
+    #     避免纯网线现场导出为空。
+    rest = [d for d in all_devices if d not in by_ip]
+    usb_rest = [d for d in rest if is_local_connection(d)]
+    net_rest = [d for d in rest if not is_local_connection(d)]
+    net_pick: list[dict] = []
+    if want:
+        # 手动勾选模式：all_devices 已被裁成勾选的那几台，全部纳入，不再筛选
+        net_pick = net_rest
+    elif net_only:
+        # 纯网线现场（一台 USB 都没有）：所有网络设备都导，否则结果为空
+        net_pick = list(by_ip) + net_rest
+        by_ip = []
+    else:
+        # 自动模式：网络设备一律不进（含配网 IP 命中的那台，除非它是 USB）
+        net_pick = []
+        dropped_net = list(by_ip) + net_rest
+        by_ip = [d for d in by_ip if is_local_connection(d)]
+        if dropped_net and note_cb:
+            note_cb("只导出电脑 USB 直连的设备，以下 "
+                    f"{len(dropped_net)} 台以太网/Wi-Fi 设备不导："
+                    + "；".join(
+                        " · ".join(p for p in (d.get("name"),
+                                               d.get("serial") or d.get("name") or "?",
+                                               d.get("ip") and f"IP={d['ip']}") if p)
+                        for d in dropped_net))
+
+    # 已经被其它来源（手机导出包）覆盖的设备：先剔除，避免同一台设备被拉两份
+    # （目录里出现带时间戳后缀的重名文件）。
+    skip = {str(s).strip().upper() for s in (skip_serials or ()) if str(s).strip()}
+    if skip:
+        def _covered(d):
+            return (d.get("serial") or "").strip().upper() in skip
+        covered = [d for d in (by_ip + usb_rest + net_pick) if _covered(d)]
+        if covered:
+            by_ip = [d for d in by_ip if not _covered(d)]
+            usb_rest = [d for d in usb_rest if not _covered(d)]
+            net_pick = [d for d in net_pick if not _covered(d)]
+            if note_cb:
+                note_cb("手机上已有这些设备的日志，不再重复拉取："
+                        + "、".join((d.get("serial") or "?") for d in covered))
+
+    # 以太网设备限速：固件日志单台往往十几秒到一分钟，一网段七八台会把整次导出
+    # 拖到几分钟，所以最多拉 max_network 台。挑选顺序（重要）：
+    #   1) 历史记忆里**导出次数多 / 最近导出过**的设备优先——用户真正想要的是他
+    #      反复在用的那几台。按延迟猜「远近」并不可靠：同一交换机内几毫秒的差异
+    #      纯属抖动，同一批设备每次排序都可能不同（现场反馈「选的三台不是我想要的」）。
+    #   2) 没有历史的设备才按 ping 延迟排序补位。
+    #   3) 配网设备（prefer_ip 命中）保底，它一定是用户当下在操作的那台。
+    # 注意：自动模式只导 USB 设备，by_ip/net_pick 此时都为空，这段不会触发；
+    # 只有手动勾选、或一台 USB 都没有的纯网线现场才会用到。
+    if max_network is not None:
+        limit = int(max_network)
+        net_all = by_ip + net_pick
+        if len(net_all) > limit:
+            mem = load_device_memory()
+            # 有历史的排前面（按次数/时间），无历史的按延迟排后面
+            known = [d for d in net_all
+                     if str(d.get("serial") or "").strip().upper() in mem]
+            unknown = [d for d in net_all
+                       if str(d.get("serial") or "").strip().upper() not in mem]
+            known.sort(key=lambda d: _memory_rank(d, mem))
+            picked = list(known[:limit])
+            if len(picked) < limit:
+                picked += _closest_devices(unknown, limit - len(picked))
+            # 配网设备保底：它一定是用户当下在操作的那台，不能被挤掉。
+            # 名额已满时挤掉最不优先的那台（先进先出：picked 末尾是优先级最低的）。
+            for d in by_ip:
+                if any(_same_device(d, x) for x in picked):
+                    continue
+                if len(picked) >= limit:
+                    picked.pop()
+                picked.insert(0, d)
+            kept = _dedupe(picked)
+            by_ip = [d for d in by_ip if any(_same_device(d, k) for k in kept)]
+            net_pick = [d for d in kept
+                        if not any(_same_device(d, b) for b in by_ip)]
+            if note_cb:
+                names = "、".join(
+                    f"{(d.get('serial') or d.get('name') or '?')}"
+                    f"（历史 {int((mem.get(str(d.get('serial') or '').strip().upper()) or {}).get('count') or 0)} 次）"
+                    if str(d.get("serial") or "").strip().upper() in mem
+                    else f"{(d.get('serial') or d.get('name') or '?')}（按延迟）"
+                    for d in kept)
+                note_cb(f"以太网设备共 {len(net_all)} 台，按历史优先取 {len(kept)} 台：{names}")
+                if len(net_all) > limit:
+                    note_cb(f"其余 {len(net_all) - limit} 台未拉取"
+                            f"（已限制为 {limit} 台，避免导出过慢）")
+
+    devices = by_ip + usb_rest + net_pick
+    # 手动模式已裁成勾选集合；自动模式下若真的空（USB 全没选上），再兜一次
     if not devices:
-        devices = select_devices(all_devices, include_network=include_network)
+        devices = select_devices(all_devices, include_network=(include_network or not want))
 
     skipped = [d for d in all_devices if d not in devices]
-    if skipped and note_cb:
-        reason = ("已按配网 IP 精确定位，其余设备未拉取" if picked_by_ip
-                  else "非 USB 直连")
-        note_cb(f"跳过 {len(skipped)} 台设备（{reason}）：" + "；".join(
-            " · ".join(p for p in (d.get("name"), d.get("serial"),
-                                   d.get("ip") and f"IP={d['ip']}") if p)
-            for d in skipped))
-
+    if skipped and note_cb and want:
+        note_cb(f"跳过 {len(skipped)} 台设备（未勾选）")
     port = int(prefer_port or config.ORBBEC_SDK_PORT or 8090)
     # 设备目录名必须全局唯一：EGOViewer 的"设备名"经常重复（两台都叫 UMI Finger，
     # 固件上报的 EGO-4B 甚至没有型号名）。只用设备名会让后一台把前一台的产物
@@ -504,8 +784,9 @@ def export_all_firmware_logs(root_dir: str, sdk_root: str = "",
                                        dev.get("connection")) if p)
         if note_cb:
             note_cb(f"[{n + 1}/{total}] 拉取设备固件日志：{label} → {folder}")
-        try:
-            paths = export_firmware_logs(
+
+        def _attempt(attempt_no: int):
+            return export_firmware_logs(
                 os.path.join(root_dir, folder), sdk_root=sdk_root,
                 device_index=int(dev.get("index", 0)),
                 # 序列号一路传下去精确选设备（枚举顺序会漂移，index 不可靠）；
@@ -517,14 +798,41 @@ def export_all_firmware_logs(root_dir: str, sdk_root: str = "",
                 progress_cb=(None if progress_cb is None else
                              (lambda pct, fname, _n=n: progress_cb(
                                  int((_n * 100 + pct) / max(total, 1)), fname))))
+
+        try:
+            try:
+                paths = _attempt(1)
+            except OrbbecSdkError as e:
+                # 设备"回了 0 字节 / IO 超时"这类抖动重试一次往往就好了（实测同一批
+                # 设备里能导的与导不了的随机分布）。只重试瞬态错误：被占用、固件日志
+                # 关闭、缺 DLL 都是稳定状态，重试只会让用户多等一轮。
+                if (cancel_event is not None and cancel_event.is_set()) \
+                        or not is_transient_error(e):
+                    raise
+                if note_cb:
+                    note_cb(f"设备 {label} 首次拉取失败（{e}），"
+                            f"{FIRMWARE_RETRY_DELAY_S:g} 秒后重试一次…")
+                if cancel_event is not None:
+                    if cancel_event.wait(FIRMWARE_RETRY_DELAY_S):
+                        raise OrbbecSdkError("固件日志导出已取消", kind="canceled")
+                else:
+                    time.sleep(FIRMWARE_RETRY_DELAY_S)
+                paths = _attempt(2)
+                if note_cb:
+                    note_cb(f"设备 {label} 重试成功：{len(paths)} 个文件")
         except OrbbecSdkError as e:
-            # 单台失败不影响其它设备，最后统一汇报（带 kind 供上层给精确提示）
+            # 单台失败不影响其它设备，最后统一汇报（带 kind 供上层给精确提示）。
+            # kind 走 _classify_error 再定一次：底层抛出的原始串（如 statusCode: 8）
+            # 没带 kind 时，到这里才能被识别成 unresponsive，而不是笼统的 other。
             errors.append({"name": dev.get("name"), "serial": dev.get("serial"),
-                           "error": str(e), "kind": getattr(e, "kind", "other")})
+                           "error": str(e), "kind": _classify_error(e)})
             if note_cb:
                 note_cb(f"设备 {label} 拉取失败：{e}")
             continue
         ok[folder] = dict(dev, paths=paths)
+    # 成功拉到日志的设备记进「历史记忆」，下次导出优先选它们
+    if ok:
+        remember_devices(list(ok.values()))
     return {"ok": ok, "errors": errors, "skipped": skipped}
 
 

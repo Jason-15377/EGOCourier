@@ -146,6 +146,38 @@ def ping(host: str, timeout_ms: int = 1000) -> bool:
         return False
 
 
+_PING_MS_RE = re.compile(r"(?:时间|time)[=<]\s*(\d+(?:\.\d+)?)\s*ms", re.IGNORECASE)
+
+
+def ping_ms(host: str, timeout_ms: int = 300) -> float:
+    """对 host 发一个 ping，返回往返毫秒数；不可达/超时返回一个很大的值。
+
+    用于给网络设备排「远近」——以太网设备没有蓝牙 RSSI，只能用延迟近似。
+    中文/英文版 Windows 的输出分别是「时间=12ms」「time=12ms」，都要认。
+    超时返回 1e9，让它在排序里稳定沉底，而不是把不可达设备排到前面。
+    """
+    host = (host or "").strip()
+    if not host or host == "0.0.0.0":
+        return 1e9
+    try:
+        r = subprocess.run(
+            ["ping", "-n", "1", "-w", str(int(timeout_ms)), host],
+            capture_output=True, timeout=timeout_ms / 1000.0 + 2)
+    except Exception:
+        return 1e9
+    if r.returncode != 0:
+        return 1e9
+    text = (r.stdout or b"").decode("mbcs", "replace")
+    m = _PING_MS_RE.search(text)
+    if m:
+        try:
+            return float(m.group(1))
+        except ValueError:
+            pass
+    # 能 ping 通但解析不出时间：给一个「可达但未知」的中等值，排在超时设备之前
+    return 1e6
+
+
 def probe_device(host: str, timeout_ms: int = 1000) -> Dict[str, object]:
     """导出前连通性预检：返回 {reachable, same_net, local_ip}。"""
     return {

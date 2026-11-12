@@ -7,6 +7,15 @@
 勾选 firmware 时通过 Orbbec SDK 从设备实时拉取最新固件日志（与 EGOViewer「导出日志」
 同一条接口，默认方式；失败即报错，不静默换通道）→ 导入分析 + 报告；
 「打包导出」按筛选/手动勾选打包成 zip，勾选 firmware 时同样实时拉取。
+
+导出目录结构：
+    <导出目录>/app/、sdk/           本机 EGOViewer 日志
+    <导出目录>/firmware/<SN>/       电脑经 SDK 拉到的设备固件日志（每台设备一个目录，
+                                    统一收进 firmware/，方便整包交给开发）
+    <导出目录>/<机型>/<SN>-<时间戳>/ 勾了手机日志时，手机导出包展开的设备分组
+                                    （与电脑端拉到同一台设备时，PC 产物并入这里）
+「固件设备」行决定 PC 端补拉哪几台——手机只带它当时连着的设备，指环/手表等
+从设备要靠电脑补齐。
 """
 
 from __future__ import annotations
@@ -15,7 +24,7 @@ import os
 import threading
 import time
 from datetime import datetime
-from typing import Dict
+from typing import Dict, Optional
 
 from PySide6.QtCore import (Qt, QThread, Signal, QSettings, QPoint, QRect, QEvent,
                             QDateTime, QTime, QTimer, QElapsedTimer, QObject)
@@ -212,7 +221,7 @@ class EvLogPackWorker(QThread):
 
     def __init__(self, root, out_dir, keys, stage_kwargs=None, auto_import=False,
                  auto_report=False, prefix="EGOViewer_logs",
-                 device_host="", sdk_port=None, sdk_root=""):
+                 device_host="", sdk_port=None, sdk_root="", firmware_serials=None):
         super().__init__()
         self.root, self.out_dir, self.keys = root, out_dir, keys
         self.stage_kwargs = dict(stage_kwargs or {})
@@ -222,6 +231,8 @@ class EvLogPackWorker(QThread):
         self.device_host = device_host
         self.sdk_port = sdk_port
         self.sdk_root = sdk_root
+        # 「固件设备」的手动勾选：与一键导出同一语义，空=自动（历史优先）
+        self.firmware_serials = [s for s in (firmware_serials or []) if s]
         self.cancel_event = threading.Event()
 
     def cancel(self):
@@ -253,7 +264,7 @@ class EvLogPackWorker(QThread):
                 puller = EgoOneClickExportWorker(
                     self.root, pull_work, ["firmware"], stage_kwargs=self.stage_kwargs,
                     device_host=self.device_host, sdk_port=self.sdk_port,
-                    sdk_root=self.sdk_root)
+                    sdk_root=self.sdk_root, firmware_serials=self.firmware_serials)
                 puller.status.connect(self.status.emit)
                 puller.progress.connect(self.progress.emit)
                 puller.cancel_event = self.cancel_event
@@ -350,6 +361,14 @@ _FIRMWARE_ERR_HINTS = {
         "等待设备回传固件日志超时。\n"
         "可能是日志文件过大或链路不稳定（USB 线接触不良 / Wi-Fi 干扰）。\n"
         "建议改为单台设备重试，并靠近路由器。",
+    "unresponsive":
+        "设备能枚举到，但读不动它（SDK 回包 0 字节，典型的 IO 失败）。\n"
+        "这台设备大概率已经掉线或固件卡住：它仍留在枚举列表里，但实际已不响应。\n"
+        "建议：\n"
+        "  1) 重新插拔该设备的 USB 线，或给设备断电重启后重试；\n"
+        "  2) 确认 EGOViewer 没有正连着它（两者会争抢设备）；\n"
+        "  3) 若它只能走网线/Wi-Fi，确认该 IP 能 ping 通、交换机口正常。\n"
+        "其它设备的日志不受影响。",
     "canceled":
         "操作已取消。",
 }
@@ -374,28 +393,126 @@ def _safe_leaf(name: str) -> str:
     return cleaned.strip(" .") or "device"
 
 
+def _max_network_devices(config) -> Optional[int]:
+    """以太网设备拉取上限（来自 config.FIRMWARE_MAX_NETWORK_DEVICES）。
+
+    0 或负数表示不限制，返回 None。配置缺失时按 3 台处理。
+    """
+    raw = getattr(config, "FIRMWARE_MAX_NETWORK_DEVICES", 3)
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return 3
+    return n if n > 0 else None
+
+
+# 电脑端固件日志的归集目录名：导出根下的 firmware/<SN>/。
+# 与 evlog_pack 打包时的 firmware/ 分类同名，开发者拿到导出目录时习惯一致。
+_FW_SUBDIR = "firmware"
+
+
+def _resolve_device_dir(export_root: str, serial: str, mobile_ok: bool = True,
+                        fw_subdir: str = "") -> str:
+    """找该序列号在导出目录下**已存在的**设备目录（含手机 <机型>/<SN>/）。
+
+    手机先拉时会建立 <导出目录>/<机型>/<SN>/；此后 USB 拉到同一序列号，
+    直接返回那个目录，让两份日志并到一起，而不是另建一个同名目录。
+    找不到则返回空串，由调用方按默认规则新建。
+
+    fw_subdir：电脑端固件日志的归集目录名（如 "firmware"）。非空时先在这个
+    子目录下找（上一轮导出的 <导出目录>/firmware/<SN>/），这样反复导出到同一
+    输出目录时，同一台设备始终用同一个文件夹，不会越堆越多。
+
+    mobile_ok=False：本轮手机日志没拉，导出目录里若还躺着历史手机目录
+    （输出目录就是以前的导出目录），那层 <机型>/ 不代表任何来源，不能把 USB
+    产物并进去——否则三台设备从根目录消失、藏进某个机型文件夹。此时只认
+    固件归集目录下的 <SN>/，机型层跳过。
+    """
+    sn = (serial or "").strip()
+    if not sn:
+        return ""
+    root = os.path.abspath(export_root)
+    # 固件归集目录下同名目录（上一轮导出建的）
+    if fw_subdir:
+        direct = os.path.join(root, fw_subdir, _safe_leaf(sn))
+        if os.path.isdir(direct):
+            return direct
+    else:
+        # 旧结构兼容：早期导出把设备目录直接挂在导出根下
+        direct = os.path.join(root, _safe_leaf(sn))
+        if os.path.isdir(direct):
+            return direct
+    if not mobile_ok:
+        return ""
+    # 机型目录下的设备分组（手机建的）：手机侧目录名是 <SN>-<时间戳>-<hash>，
+    # 不是裸 <SN>，所以要按「序列号 + 连字符」前缀匹配，否则永远对不上，
+    # 同一台设备会在根目录和机型目录各留一份。只扫一层子目录，不深挖。
+    want = _safe_leaf(sn).upper()
+    try:
+        for name in sorted(os.listdir(root)):
+            if fw_subdir and name.lower() == fw_subdir.lower():
+                continue        # 固件归集目录不是手机机型目录
+            sub = os.path.join(root, name)
+            if not os.path.isdir(sub):
+                continue
+            cand_exact = os.path.join(sub, _safe_leaf(sn))
+            if os.path.isdir(cand_exact):
+                return cand_exact
+            try:
+                subs = os.listdir(sub)
+            except OSError:
+                continue
+            for leaf in sorted(subs):
+                if not leaf.upper().startswith(want + "-"):
+                    continue
+                cand = os.path.join(sub, leaf)
+                if os.path.isdir(cand):
+                    return cand
+    except OSError:
+        pass
+    return ""
+
+
 def _pull_firmware_from_device(fw_root, at, sdk_root, orbbec_sdk, config,
                                status=None, progress=None, cancel_event=None,
-                               device_host="", port=None, prefer_ip="") -> list:
-    """从**所有已连接设备**各拉一份固件日志，返回 [(绝对路径, 相对 rel)]。
+                               device_host="", port=None, prefer_ip="",
+                               skip_serials=(), only_serials=(),
+                               skip_mobile_serials=True) -> list:
+    """从**所有可访问设备**各拉一份固件日志，返回 [(绝对路径, 相对 rel)]。
 
-    磁盘结构：fw_root/<设备名_序列号>/<拉取时刻>/<设备侧原文件名>
-    rel   结构：<设备名_序列号>/<拉取时刻>/<文件名>   ← 与磁盘严格一致
+    磁盘结构：fw_root/firmware/<序列号>/<设备侧原文件名>
+    rel   结构：firmware/<序列号>/<文件名>   ← 与磁盘严格一致
+
+    电脑端拉到的那几台设备统一收进 **firmware/** 子目录，导出根目录只剩
+    app/、sdk/、firmware/ 与手机机型目录，交开发时一眼能看出哪些是设备固件日志。
+    例外：序列号与手机导出包里某个分组是同一台设备时，产物并入手机那份
+    <机型>/<SN>-<时间戳>/，保证同一台设备在导出目录里只出现一次。
+
+    目录名用**序列号**，与手机侧 <机型>/<SN>/ 一致；同一台设备的日志始终
+    落在同一个目录里，不再套「拉取时刻」子层（早先的
+    `<设备名_序列号>/<拉取时刻>/` 会让同一台设备每次导出换一个目录）。
 
     目录名必须带序列号：EGOViewer 的"设备名"经常重复（两台 UMI Finger、固件的
     EGO-4B 甚至没有型号名）。只按设备名建目录时，多台设备的产物会挤进同一层，
     现场表现为"导出的三份固件日志内容完全一样"。
 
-    实现要点：SDK 回调只能指定一个输出目录，无法按"设备/时刻"两级组织，因此先拉到
-    _staging，再逐文件 move 到目标位置。这样同时解决"rel 与磁盘不符"和"同一目录
-    重复导出互相覆盖"两个问题，同名同秒的产物再加时间戳后缀兜底。
+    实现要点：SDK 回调只能指定一个输出目录，无法按设备组织，因此先拉到
+    _staging，再逐文件 move 到目标位置。同名产物（重复导出）加时间戳后缀兜底。
 
-    device_host / prefer_ip：配网拿到的设备 IP。它只作为**精确定位**条件传给 SDK
-    （prefer_ip），命中的那一台不论 USB 还是 Ethernet 都会被拉取。
+    device_host / prefer_ip：配网拿到的设备 IP。它只作为**优先**条件传给 SDK
+    （prefer_ip），命中的那台先拉；**其余设备仍然照拉**，因为从设备（指环/手表）
+    往往只有网线或独立 IP，漏掉它们就会「看不到从设备日志」。
 
-    这里**不**传 include_network：局域网里 GVCP 广播能把别人机器上的一堆设备都扫出来，
-    一旦放开，本机只插 3 台 USB 也会把整个网段的设备全导一遍。而"本机没插 USB"的场景
-    SDK 侧已有兜底（select_devices 在一台 USB 都没有时返回全部设备），不需要靠它。
+    这里**不**传 include_network：局域网里 GVCP 广播能把别人机器上的一堆设备
+    都扫出来。但「本机没有 USB 直连设备」时，必须让网络设备参与，否则只有网线
+    连接时整批为空（select_devices 已在一台 USB 都没有时返回全部设备，见下）。
+
+    skip_mobile_serials：**只管已有手机产物目录**，与 skip_serials（手机本次
+    已拉到的序列号）是两件事。手机日志未勾选时，导出目录下仍可能躺着历史手机
+    导出留下的 <机型>/<SN>/（用户把输出目录指向了旧导出或就地重跑）。此时按同一
+    SN 落盘，USB 产物会被 `_resolve_device_dir` 并进那个陈旧目录，「三台设备
+    直接放在根目录」就变成「藏进某个机型文件夹」，看起来像被删掉了。这种历史
+    目录在本轮不代表手机来源，所以默认跳过，让设备目录老老实实新建在根目录。
     """
     import shutil
 
@@ -406,12 +523,11 @@ def _pull_firmware_from_device(fw_root, at, sdk_root, orbbec_sdk, config,
         return " · ".join(p for p in (info.get("name"), info.get("serial"),
                                       info.get("connection") or "") if p) or leaf
 
-    pull_name = datetime.fromtimestamp(at).strftime("%Y%m%d-%H%M%S")
     emit("通过 Orbbec SDK 从设备实时拉取固件日志（与 EGOViewer「导出日志」一致）…"
          "（保持设备连接）")
     target_ip = (prefer_ip or device_host or "").strip()
     if target_ip:
-        emit(f"目标设备 IP：{target_ip}（将按此 IP 精确定位该设备）")
+        emit(f"优先设备 IP：{target_ip}（先拉这台，其余设备同样会拉）")
 
     stage_root = os.path.join(fw_root, "_staging")
     os.makedirs(stage_root, exist_ok=True)
@@ -424,7 +540,10 @@ def _pull_firmware_from_device(fw_root, at, sdk_root, orbbec_sdk, config,
             # 不放开网络枚举：IP 只用来精确定位那一台（见函数说明）。
             include_network=False,
             prefer_ip=target_ip,
-            prefer_port=int(port or 0))
+            prefer_port=int(port or 0),
+            skip_serials=skip_serials,
+            max_network=_max_network_devices(config),
+            only_serials=only_serials)
     except orbbec_sdk.OrbbecSdkError as e:
         if cancel_event is not None and cancel_event.is_set():
             raise evlog_pack.OperationCancelled("操作已取消") from e
@@ -435,24 +554,28 @@ def _pull_firmware_from_device(fw_root, at, sdk_root, orbbec_sdk, config,
     out = []
     try:
         for folder, info in result.get("ok", {}).items():
-            # 目录名带序列号：SDK 侧的 folder 现在就是「设备名_序列号」，这里再
-            # 兜一层，保证同型号多台设备的日志永远不会落到同一个目录里。
+            # 目录名统一用设备**序列号**，并且**不再套一层拉取时刻**：同一台设备的
+            # 日志始终落在同一个目录里，不会出现「EGOPro_AZL9861004V/20261110-111558/」
+            # 这种东一个西一个的层级。
+            # 若手机侧已经为同一序列号建了 <机型>/<SN>/，就把 USB 产物并进去，
+            # 让「同一台设备」在导出目录里只出现一次。
             serial = (info.get("serial") or "").strip()
-            leaf = folder
-            if serial and serial not in leaf:
-                leaf = _safe_leaf(f"{folder}_{serial}")
-            dest_dir = os.path.join(fw_root, leaf, pull_name)
+            leaf = _safe_leaf(serial) if serial else _safe_leaf(folder)
+            dest_dir = (_resolve_device_dir(fw_root, serial,
+                                            mobile_ok=skip_mobile_serials,
+                                            fw_subdir=_FW_SUBDIR)
+                        or os.path.join(fw_root, _FW_SUBDIR, leaf))
             os.makedirs(dest_dir, exist_ok=True)
             for p in info.get("paths", []):
                 base = os.path.basename(p)
                 dest = os.path.join(dest_dir, base)
                 if os.path.exists(dest):
-                    # 同一秒内重复导出同一设备：加时间戳后缀，绝不覆盖
+                    # 同名文件已存在（重复导出 / 与手机那份重名）：加时间戳后缀，绝不覆盖
                     stem, ext = os.path.splitext(base)
                     base = f"{stem}_{int(at)}{ext}"
                     dest = os.path.join(dest_dir, base)
                 shutil.move(p, dest)
-                out.append((dest, f"{leaf}/{pull_name}/{base}"))
+                out.append((dest, f"{_FW_SUBDIR}/{leaf}/{base}"))
             emit(f"设备 {label_of(info, leaf)}：{len(info.get('paths', []))} 个文件")
     finally:
         shutil.rmtree(stage_root, ignore_errors=True)
@@ -472,8 +595,13 @@ def _pull_firmware_from_device(fw_root, at, sdk_root, orbbec_sdk, config,
         raise RuntimeError(
             "所有设备均未拉取到固件日志" + (f"（{detail}）" if detail else ""))
     if errors:
+        # 汇总时把原因类型也带上：光给设备名，用户看不出是"没插好"还是"被占用"。
+        def _why(e):
+            kind = e.get("kind") or "other"
+            head = _FIRMWARE_ERR_HINTS.get(kind, "").splitlines()
+            return head[0] if head else str(e.get("error") or "")
         emit(f"有 {len(errors)} 台设备拉取失败，其余设备产物已保留："
-             + "；".join(f"{e.get('name') or '未知设备'}（{e.get('error')}）"
+             + "；".join(f"{e.get('name') or '未知设备'}（{_why(e)}）"
                         for e in errors))
     return out
 
@@ -649,7 +777,8 @@ def _fmt_dur(sec) -> str:
 # 一键导出后台线程：识别 EGOViewer 根目录 → 全新时间戳目录收集所选分类日志 → 导入分析 + 报告
 #   每次都在输出目录下新建 EGO_export_<时间戳>/，从源目录现拉最新日志，不复用本地旧日志。
 #   app/sdk 按当前筛选方式（时间段 / 手动勾选）筛选后收集。
-#   勾选 firmware 时通过 Orbbec SDK 从设备实时拉取最新固件日志（等价 EGOviewer「导出设备日志」）。
+#   勾选 firmware 时通过 Orbbec SDK 从设备实时拉取最新固件日志（等价 EGOviewer「导出设备日志」），
+#   设备目录 <SN>/ 直接平铺在导出目录下，与 app/ sdk/ 同级（不套 firmware/）。
 # ---------------------------------------------------------------------------
 class EgoOneClickExportWorker(QThread):
     progress = Signal(int)              # 0..100
@@ -660,7 +789,8 @@ class EgoOneClickExportWorker(QThread):
 
     def __init__(self, root, out_dir, keys, stage_kwargs=None,
                  auto_import=False, auto_report=False,
-                 device_host="", sdk_port=None, mobile_serials=None, sdk_root=""):
+                 device_host="", sdk_port=None, mobile_serials=None, sdk_root="",
+                 firmware_serials=None):
         super().__init__()
         self.root, self.out_dir, self.keys = root, out_dir, keys
         self.stage_kwargs = dict(stage_kwargs or {})
@@ -668,6 +798,8 @@ class EgoOneClickExportWorker(QThread):
         self.auto_report = auto_report
         # 手机日志与固件日志并列参与同一次导出；None/空表示不碰手机。
         self.mobile_serials = list(mobile_serials or [])
+        # 用户在「固件设备」里手动勾选的序列号；空表示走自动策略（历史优先 → 延迟）。
+        self.firmware_serials = [s for s in (firmware_serials or []) if s]
         # 固件日志只有一条来源：Orbbec SDK 固件日志回调（与 EGOViewer「导出日志」一致）。
         self.device_host = device_host
         self.sdk_port = sdk_port
@@ -682,11 +814,40 @@ class EgoOneClickExportWorker(QThread):
     def _want_cancel(self) -> bool:
         return self.cancel_event.is_set()
 
-    def _pull_firmware(self, fw_root, pull_at, orbbec_sdk, config) -> list:
-        """经 Orbbec SDK 实时拉取**所有已连接设备**的固件日志。
+    def _mobile_covered_serials(self):
+        """手机导出包里已经包含的设备序列号（USB 拉取时跳过这些，避免重复）。
 
-        返回 [(绝对路径, 相对 firmware/ 的路径)]，相对路径形如
-        <设备名>/<拉取时刻>/<设备侧原文件名>，即按设备名分类。
+        手机侧设备目录名就是序列号；快照分组 <SN>-<时间戳>-<hash> 已按 SN 归并，
+        所以这里直接取目录名即可。没有手机汇总时返回空集合。
+        """
+        serials = set()
+        try:
+            from ego_relay import mobile_adb
+            pat = mobile_adb._GROUP_SN_RE
+        except Exception:  # noqa: BLE001
+            pat = None
+        summary = getattr(self, "mobile_summary", None) or {}
+        for ph in summary.get("phones", []):
+            for b in ph.get("bundles", []):
+                for d in b.get("devices", []):
+                    grp = str(d.get("group") or "").strip()
+                    if not grp:
+                        continue
+                    m = pat.match(grp) if pat else None
+                    serials.add((m.group(1) if m else grp).upper())
+        return serials
+
+    def _pull_firmware(self, fw_root, pull_at, orbbec_sdk, config) -> list:
+        """经 Orbbec SDK 实时拉取**所有可访问设备**的固件日志。
+
+        返回 [(绝对路径, 相对导出目录的路径)]，相对路径形如
+        firmware/<序列号>/<设备侧原文件名>。
+
+        两套逻辑互不干扰：
+          · 勾了手机日志：手机先拉进 <机型>/<SN>-<时间戳>/，同一台设备（同 SN）
+            的 USB 产物并进那个手机目录，不让它在导出目录里出现两次；
+          · 没勾手机日志：USB 产物一律新建在 firmware/<SN>/，不会被历史手机
+            目录吞掉（skip_mobile_serials=False）。
         整个时间段不命中时返回空列表（并提示）；取消抛 OperationCancelled；
         全部设备失败时抛 RuntimeError 中止，不换通道——避免产物来源不明。
         """
@@ -703,12 +864,16 @@ class EgoOneClickExportWorker(QThread):
                 f"本次固件日志拉取时间 {pull_name} 早于所选时间段起点，跳过 firmware"
                 "（如需包含请把时间段起点往前调）")
             return []
+        mobile_ok = "mobile" in self.keys and bool(self.mobile_serials)
         items = _pull_firmware_from_device(
             fw_root, pull_at, self.sdk_root, orbbec_sdk, config,
             status=self.status.emit,
             progress=lambda pct: self.progress.emit(_stage_map("firmware", pct)),
             cancel_event=self.cancel_event,
-            device_host=self.device_host, port=self.sdk_port)
+            device_host=self.device_host, port=self.sdk_port,
+            skip_serials=self._mobile_covered_serials(),
+            only_serials=self.firmware_serials,
+            skip_mobile_serials=mobile_ok)
         # 固件日志的时间判定统一按「本次拉取时刻」，与 per-file 无关，这里只做整体命中判定
         return items
 
@@ -748,48 +913,13 @@ class EgoOneClickExportWorker(QThread):
             except Exception:  # noqa: BLE001
                 pass
             collected = {}
-            # 固件日志只导一份：勾了手机日志时，固件日志由手机（Wi-Fi 连设备）提供，
-            # 不再从电脑 USB 重复拉一遍；只有没勾手机日志时才走 Orbbec SDK 直连拉取。
+            # 先拉手机：它会把导出包里的每台设备解成 <导出目录>/<机型>/<SN>/，
+            # 后面 USB 拉到的同 SN 设备才能并进同一个目录，而不是各占一处。
+            # 固件日志两条来源是互补的，不是二选一：
+            #   · 手机导出包：手机连着的设备（通常是最新那台）在导出时自动打进去；
+            #   · 电脑 USB/网络：电脑能访问的设备（含左右指环 / 手表等**从设备**）
+            #     只有 Orbbec SDK 直连才拿得到——手机导出包不会替电脑照片从设备。
             mobile_covers_firmware = "mobile" in self.keys and bool(self.mobile_serials)
-            # firmware 先拉：失败要尽早中止，不要先把本机日志复制一遍再报错。
-            #   所有已连接设备都拉，按设备名分类落盘：
-            #   <导出目录>/firmware/<设备名>/<拉取时刻>/orbbec_2026-10-14.log
-            if "firmware" in self.keys and not mobile_covers_firmware:
-                if self._want_cancel():
-                    raise evlog_pack.OperationCancelled("操作已取消")
-                pull_at = time.time()
-                fw_root = os.path.join(export_dir, "firmware")
-                clock["t"] = time.monotonic()
-                fw_items = self._pull_firmware(fw_root, pull_at, orbbec_sdk, config)
-                fw_bytes = sum(os.path.getsize(p) for p, _r in fw_items
-                               if os.path.exists(p))
-                self._diag(f"固件日志拉取结束：{len(fw_items)} 个文件，"
-                           f"{_human_size(fw_bytes)}，耗时 "
-                           f"{_fmt_dur(time.monotonic() - clock['t'])}")
-                if fw_items:
-                    collected["firmware"] = [
-                        {"abs": p, "rel": rel, "from_name": True}
-                        for p, rel in fw_items]
-            elif "firmware" in self.keys and mobile_covers_firmware:
-                self.status.emit(
-                    "已勾选手机日志：固件日志取自手机导出（<机型>/固件日志/），"
-                    "跳过电脑 USB 直连拉取")
-            # app/sdk：从本机 EGOViewer 根目录收集，按当前筛选方式应用时间/手动筛选
-            app_sdk = [k for k in self.keys if k not in ("firmware", "mobile")]
-            if app_sdk:
-                self.status.emit("收集 app/SDK 日志…")
-                clock["t"] = time.monotonic()
-                _staged, c = evlog_pack.stage(
-                    self.root, export_dir, app_sdk,
-                    progress_cb=lambda pct: self.progress.emit(_stage_map("stage", pct)),
-                    should_cancel=self._want_cancel,
-                    **self.stage_kwargs)
-                collected.update(c)
-                self._diag("本机日志收集结束："
-                           + "、".join(f"{k} {len(v)} 个"
-                                       for k, v in collected.items())
-                           + f"，耗时 {_fmt_dur(time.monotonic() - clock['t'])}")
-            # 手机日志：与固件日志同一次导出，落到 <导出目录>/mobile/<机型>/，原样搬运
             if "mobile" in self.keys and self.mobile_serials:
                 if self._want_cancel():
                     raise evlog_pack.OperationCancelled("操作已取消")
@@ -821,6 +951,54 @@ class EgoOneClickExportWorker(QThread):
                             for b in ph.get("bundles", []))
                 self._diag(f"手机日志拉取结束：{n_mob} 个设备分组，耗时 "
                            f"{_fmt_dur(time.monotonic() - clock['t'])}")
+            # 固件日志：所有能访问到的设备都拉，按**序列号**落盘，统一收进
+            # firmware/（开发者拿导出目录时一眼能分出设备固件日志）：
+            #   <导出目录>/firmware/<SN>/orbbec_2026-11-14.log
+            # 勾了手机时，手机已建好 <机型>/<SN>-<时间戳>/，同一台设备的 USB 产物
+            # 并入该目录，不再另起一份；没勾手机时一律新建在 firmware/ 下，
+            # 历史手机目录不参与（见 _pull_firmware）。
+            if "firmware" in self.keys:
+                if self._want_cancel():
+                    raise evlog_pack.OperationCancelled("操作已取消")
+                pull_at = time.time()
+                clock["t"] = time.monotonic()
+                try:
+                    fw_items = self._pull_firmware(export_dir, pull_at, orbbec_sdk, config)
+                except RuntimeError as e:
+                    # 勾了手机日志时，手机导出包本身就能提供固件日志：USB 端一台都
+                    # 拉不到（电脑没插设备 / 只有网络设备）不应让整轮导出失败。
+                    if not mobile_covers_firmware:
+                        raise
+                    self.status.emit(
+                        f"电脑端未拉到固件日志（{e}）；本次以手机导出包为准继续")
+                    fw_items = []
+                fw_bytes = sum(os.path.getsize(p) for p, _r in fw_items
+                               if os.path.exists(p))
+                self._diag(f"固件日志拉取结束：{len(fw_items)} 个文件，"
+                           f"{_human_size(fw_bytes)}，耗时 "
+                           f"{_fmt_dur(time.monotonic() - clock['t'])}")
+                if fw_items:
+                    collected["firmware"] = [
+                        {"abs": p, "rel": rel, "from_name": True}
+                        for p, rel in fw_items]
+                elif mobile_covers_firmware:
+                    self.status.emit(
+                        "固件日志由手机导出包提供（<机型>/<SN>/），电脑端无可用设备")
+            # app/sdk：从本机 EGOViewer 根目录收集，按当前筛选方式应用时间/手动筛选
+            app_sdk = [k for k in self.keys if k not in ("firmware", "mobile")]
+            if app_sdk:
+                self.status.emit("收集 app/SDK 日志…")
+                clock["t"] = time.monotonic()
+                _staged, c = evlog_pack.stage(
+                    self.root, export_dir, app_sdk,
+                    progress_cb=lambda pct: self.progress.emit(_stage_map("stage", pct)),
+                    should_cancel=self._want_cancel,
+                    **self.stage_kwargs)
+                collected.update(c)
+                self._diag("本机日志收集结束："
+                           + "、".join(f"{k} {len(v)} 个"
+                                       for k, v in collected.items())
+                           + f"，耗时 {_fmt_dur(time.monotonic() - clock['t'])}")
             n = sum(len(v) for v in collected.values())
             has_mobile = bool(
                 self.mobile_summary and any(
@@ -873,6 +1051,9 @@ class EgoOneClickExportWorker(QThread):
             self.done.emit(export_dir, sid, report_path, self.mobile_summary)
         except evlog_pack.OperationCancelled:
             self.status.emit("一键导出已取消")
+            # 取消时删掉本次目录：里面只有半拉的文件，留着会被下次的导入/人工检查
+            # 当成一份"导出的结果"（打包那边同样不留残缺 zip）。
+            self._discard_partial(export_dir)
             self.cancelled.emit()
         except Exception as e:  # noqa: BLE001
             # 失败时把阶段耗时和完整堆栈一起落盘：弹窗只有一句 str(e)，
@@ -883,7 +1064,25 @@ class EgoOneClickExportWorker(QThread):
                 _diag(self.out_dir, "堆栈：\n" + _tb.format_exc())
             except Exception:  # noqa: BLE001
                 pass
+            # 失败同样丢弃本次目录（诊断日志写在输出根目录，不受影响）。
+            self._discard_partial(export_dir)
             self.failed.emit(str(e))
+
+    def _discard_partial(self, export_dir):
+        """删除本次导出留下的半成品目录（取消/失败）。
+
+        只动自己刚建的那个 EGO_export_<时间戳>/，不碰输出根目录下别人的东西；
+        诊断日志在输出根目录，删了也不丢排查信息。删除失败（文件被占用）不抛错
+        ——它只是清理，不能覆盖真实的取消/失败原因。
+        """
+        import shutil as _sh
+        if not export_dir or not os.path.isdir(export_dir):
+            return
+        try:
+            _sh.rmtree(export_dir, ignore_errors=True)
+            self.status.emit(f"已清理本次未完成的导出目录：{os.path.basename(export_dir)}")
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -1192,10 +1391,35 @@ class ClickableDateTimeEdit(QWidget):
 
 
 # ---------------------------------------------------------------------------
-# 手机 EGOViewer 日志导出：adb 把手机上的导出包原样搬到电脑，不做帧对齐、不改结构
-#   产物：<输出目录>/EGO_export_<时间戳>/mobile/<机型>/{app-logs-zips,sdk-logs,firmware_logs}/
-#   设备分组由手机 App 自己的包结构保证（firmware/<SN>-<时间戳>/），这里只清点并展示。
+# 手机 EGOViewer 日志导出：adb 拉导出包并把包内每台设备展开平铺，不做帧对齐
+#   产物：<输出目录>/EGO_export_<时间戳>/<机型>/<SN>-<时间戳>-<hash>/（主 + 从设备各一层）
+#   设备分组来自导出包内的 firmware/<SN>-<时间戳>/，展开时去掉 firmware/ 这一层。
 # ---------------------------------------------------------------------------
+class FirmwareDeviceScanWorker(QThread):
+    """后台枚举 Orbbec 设备，供「固件设备」手动勾选列表用。
+
+    list_devices 走 GVCP 广播，通常要几秒到十几秒，放主线程会卡住界面。
+    """
+    result = Signal(list)    # [{name,serial,connection,ip,index,ping_ms}]
+    failed = Signal(str)
+
+    def __init__(self, sdk_root=""):
+        super().__init__()
+        self.sdk_root = sdk_root
+
+    def run(self):
+        try:
+            from ego_relay import orbbec_sdk, wifi
+            devs = orbbec_sdk.list_devices(self.sdk_root)
+            for d in devs:
+                ip = (d.get("ip") or "").strip()
+                # USB 设备没有 IP，延迟不适用；网络设备给个往返延迟作参考
+                d["ping_ms"] = (wifi.ping_ms(ip) if ip and ip != "0.0.0.0" else None)
+            self.result.emit(devs)
+        except Exception as e:  # noqa: BLE001
+            self.failed.emit(str(e))
+
+
 class MobileScanWorker(QThread):
     """后台枚举 adb 设备，避免 adb 启动慢时卡住界面。"""
     result = Signal(list, list)   # ready devices, all entries（含未授权）
@@ -1210,6 +1434,107 @@ class MobileScanWorker(QThread):
             self.result.emit(mobile_adb.list_devices(adb), mobile_adb.device_status(adb))
         except Exception:  # noqa: BLE001
             self.result.emit([], [])
+
+
+class FirmwareDevicePicker(QDialog):
+    """固件设备勾选框：列出在线设备，按「导出历史」排序，让用户指定导哪几台。
+
+    为什么不用拖不动的自动策略：同一交换机内各设备 ping 差几毫秒纯属抖动，
+    每次排序结果都可能变，用户「想要的那几台」经常不在前三。这里直接让用户
+    自己勾，历史次数只作为默认勾选的依据（更好勾对）。
+    """
+
+    def __init__(self, parent, devices, memory, preselect=()):
+        super().__init__(parent)
+        self.setWindowTitle("选择要导出固件日志的设备")
+        self.resize(640, 460)
+        self._devices = list(devices)
+        self._memory = dict(memory or {})
+        pre = {str(s).upper() for s in (preselect or ())}
+        v = QVBoxLayout(self)
+
+        tip = QLabel(
+            "勾选要导出固件日志的设备。默认按「历史上导出次数多」勾选——\n"
+            "不勾任何一台时，导出会走自动策略（历史优先 → 网络延迟）。")
+        tip.setStyleSheet("color:#6b7280;")
+        v.addWidget(tip)
+
+        self.listw = QListWidget()
+        # 历史次数多的排前面，方便一眼看到常用设备
+        ordered = sorted(
+            self._devices,
+            key=lambda d: (-int((self._memory.get(str(d.get("serial") or "").upper())
+                                 or {}).get("count") or 0),
+                           str(d.get("serial") or "")))
+        for d in ordered:
+            sn = str(d.get("serial") or "").strip()
+            rec = self._memory.get(sn.upper()) or {}
+            count = int(rec.get("count") or 0)
+            last = str(rec.get("last") or "")
+            conn = d.get("connection") or ""
+            ip = (d.get("ip") or "").strip()
+            ping = d.get("ping_ms")
+            bits = [f"{d.get('name') or '设备'} · {sn or '(无序列号)'}"]
+            if conn:
+                bits.append(conn)
+            if ip and ip != "0.0.0.0":
+                bits.append(ip)
+            if ping is not None and ping < 1e6:
+                bits.append(f"{ping:.0f}ms")
+            if count:
+                bits.append(f"历史 {count} 次" + (f"（最近 {last[:10]}）" if last else ""))
+            else:
+                bits.append("未导出过")
+            it = QListWidgetItem("  |  ".join(bits))
+            it.setData(Qt.UserRole, sn)
+            it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
+            # 默认勾选：手动选过就按手动，否则默认勾历史里导出最多的那几台
+            it.setCheckState(Qt.Checked if (sn.upper() in pre) else
+                             (Qt.Unchecked if pre else Qt.Unchecked))
+            self.listw.addItem(it)
+        # 没手动选过时，默认勾上前 max_network 台（按历史排序后的前几台）
+        if not pre:
+            n = 0
+            for i in range(self.listw.count()):
+                it = self.listw.item(i)
+                sn = (it.data(Qt.UserRole) or "").upper()
+                if sn in self._memory:
+                    it.setCheckState(Qt.Checked)
+                    n += 1
+            if n == 0:      # 没有任何历史：默认勾前 1 台，避免全不勾
+                self.listw.item(0).setCheckState(Qt.Checked)
+        v.addWidget(self.listw, 1)
+
+        row = QHBoxLayout()
+        btn_all = QPushButton("全选")
+        btn_none = QPushButton("全不选")
+        btn_all.clicked.connect(lambda: self._set_all(True))
+        btn_none.clicked.connect(lambda: self._set_all(False))
+        row.addWidget(btn_all)
+        row.addWidget(btn_none)
+        row.addStretch(1)
+        v.addLayout(row)
+
+        box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        box.button(QDialogButtonBox.Ok).setText("确定")
+        box.button(QDialogButtonBox.Cancel).setText("取消")
+        box.accepted.connect(self.accept)
+        box.rejected.connect(self.reject)
+        v.addWidget(box)
+
+    def _set_all(self, on):
+        for i in range(self.listw.count()):
+            self.listw.item(i).setCheckState(Qt.Checked if on else Qt.Unchecked)
+
+    def selected_serials(self):
+        out = []
+        for i in range(self.listw.count()):
+            it = self.listw.item(i)
+            if it.checkState() == Qt.Checked:
+                sn = it.data(Qt.UserRole)
+                if sn:
+                    out.append(sn)
+        return out
 
 
 class DeviceTab(QWidget):
@@ -1228,6 +1553,7 @@ class DeviceTab(QWidget):
         self._export_worker: EgoOneClickExportWorker | None = None  # EGOviewer 一键导出（SDK 拉固件）
         self._pack_worker: EvLogPackWorker | None = None  # 本地勾选打包
         self._mobile_scan: MobileScanWorker | None = None
+        self._fw_scan: FirmwareDeviceScanWorker | None = None  # 固件设备列表枚举
         self._mobile_devices = []     # [{serial,model}]
         self._mobile_scan_ok = False  # 本页是否已成功扫到过手机（避免重复扫描）
         self._manual_selection: dict | None = None  # 手动勾选：{分类key: [绝对路径,...]}
@@ -1322,27 +1648,11 @@ class DeviceTab(QWidget):
         v.setHorizontalSpacing(10)
         v.setVerticalSpacing(8)
 
-        # --- SSH 凭证 ---
-        v.addWidget(self._field_label("设备 IP"), 0, 0)
-        self.edit_ip = QLineEdit()
-        self.edit_ip.setPlaceholderText("配网成功后自动回填，或手动填写")
-        if relay_config.DEVICE_IP:
-            self.edit_ip.setText(relay_config.DEVICE_IP)
-        elif relay_config.EXAMPLE_DEVICE_IP:
-            self.edit_ip.setText(relay_config.EXAMPLE_DEVICE_IP)
-        v.addWidget(self.edit_ip, 0, 1)
-        v.addWidget(self._field_label("用户名"), 0, 2)
-        self.edit_user = QLineEdit("root")
-        self.edit_user.setPlaceholderText("ssh 用户名（常见为 root）")
-        v.addWidget(self.edit_user, 0, 3)
-        v.addWidget(self._field_label("密码"), 0, 4)
-        self.edit_pwd_ssh = QLineEdit()
-        self.edit_pwd_ssh.setEchoMode(QLineEdit.Password)
-        self.edit_pwd_ssh.setPlaceholderText("ssh 密码")
-        v.addWidget(self.edit_pwd_ssh, 0, 5)
-
         # --- EGOViewer 根目录（本地，识别版本安装目录） ---
-        v.addWidget(self._field_label("EGOViewer 根目录"), 1, 0)
+        # 原「设备 IP / 用户名 / 密码」三格已移除：固件日志与手机日志都走
+        # Orbbec SDK / adb，实际用不到 SSH 凭证；目标设备优先取 ① 配网刚拿到的
+        # IP，List 会覆盖整个局域网。IP 只在界面上留一行状态显示。
+        v.addWidget(self._field_label("EGOViewer 根目录"), 0, 0)
         rhl = QHBoxLayout()
         self.cmb_ev_root = QComboBox()
         self.cmb_ev_root.setToolTip("自动检测到的 EGOViewer 安装目录，可手动切换")
@@ -1359,13 +1669,18 @@ class DeviceTab(QWidget):
         rhl.addWidget(btn_rescan)
         rhl.addWidget(btn_browse_root)
         rhl_w = QWidget(); rhl_w.setLayout(rhl)
-        v.addWidget(rhl_w, 1, 1, 1, 5)
+        v.addWidget(rhl_w, 0, 1, 1, 5)
+
+        # 设备 IP 不在界面上展示：配网成功后只记在 self._device_ip，
+        # 作为 SDK 的首选目标，不占表单行。
 
         # --- 手机日志（adb 拉取，勾选后参与「开始一键导出」；不勾则不碰手机） ---
-        v.addWidget(self._field_label("手机日志"), 2, 0)
+        # 行序：手机日志 → 固件设备（为手机日志补齐从设备）→ 日志类型（本机收集）。
+        v.addWidget(self._field_label("手机日志"), 1, 0)
         self.chk_mobile = QCheckBox("EGOViewer 手机日志")
         self.chk_mobile.setToolTip(
-            "勾选后导出手机 EGOViewer 的 App 日志 + 设备固件日志（adb 通道）")
+            "勾选后导出手机 EGOViewer 的 App 日志 + 设备固件日志（adb 通道）；\n"
+            "手机上连不着的从设备（指环/手表）由下方「固件设备」经电脑补齐")
         self.chk_mobile.setChecked(False)
         self.chk_mobile.toggled.connect(self._sync_mobile_enabled)
         self.cmb_mobile = QComboBox()
@@ -1388,12 +1703,47 @@ class DeviceTab(QWidget):
         mh.addWidget(self.chk_mobile)
         mh.addWidget(self.cmb_mobile, 1)
         mh.addWidget(self.lbl_mobile_state)
-        v.addWidget(mgray, 2, 1, 1, 5)
+        v.addWidget(mgray, 1, 1, 1, 5)
 
-        # --- 本地日志分类（合并为「日志类型」一行；来源路径/数量进 Tooltip） ---
+        # --- 固件设备：与「日志类型」互换位置后紧贴「手机日志」下方 ---
+        # 这一行的选择只服务手机日志导出（PC 端补齐手机连不着的从设备：指环/手表），
+        # 放得离手机日志近，用户一眼能看出两者是一组；「日志类型」是本机收集范围，
+        # 与它们无关，排到后面。
+        # 现场反馈：自动挑的「最近 3 台」并不是他想要的那几台（同交换机内延迟
+        # 差几毫秒纯属抖动），因此必须能手动指定。
+        self._fw_serials: list = []      # 手动勾选的序列号；空=自动
+        v.addWidget(self._field_label("固件设备"), 2, 0)
+        fgray = QFrame()
+        fgray.setObjectName("logTypeRow")
+        fgray.setAttribute(Qt.WA_StyledBackground, True)
+        fh = QHBoxLayout(fgray)
+        fh.setContentsMargins(10 + 12, 8, 10, 8)
+        fh.setSpacing(10)
+        self.lbl_fw_mode = QLabel()
+        self.lbl_fw_mode.setStyleSheet("color:#222;")
+        self.btn_fw_pick = QPushButton("选择设备…")
+        self.btn_fw_pick.setToolTip(
+            "列出当前在线的设备（含导出历史次数），手动勾选要导出固件日志的那几台。\n"
+            "不手动选时按「历史优先」自动挑：导出次数多 / 最近导出过的设备排前面。")
+        self.btn_fw_pick.clicked.connect(self._pick_firmware_devices)
+        self.btn_fw_auto = QPushButton("恢复自动")
+        self.btn_fw_auto.setToolTip("清除手动勾选，回到自动模式（历史优先）")
+        self.btn_fw_auto.setVisible(False)
+        self.btn_fw_auto.clicked.connect(self._reset_firmware_devices)
+        fh.addWidget(self.lbl_fw_mode, 1)
+        fh.addWidget(self.btn_fw_pick)
+        fh.addWidget(self.btn_fw_auto)
+        fw_w = QWidget(); fw_w.setLayout(fh)
+        v.addWidget(fw_w, 2, 1, 1, 5)
+        self._refresh_fw_mode_label()
+        # 只在勾了固件来源时才有意义：手机日志（含固件）与「设备固件日志」任一勾选
         self._pack_checks = {}
         self._pack_counts = {}
         self._pack_sources = {}
+        self.chk_mobile.toggled.connect(self._sync_fw_row_enabled)
+        self._sync_fw_row_enabled(self.chk_mobile.isChecked())
+
+        # --- 本地日志分类（合并为「日志类型」一行；来源路径/数量进 Tooltip） ---
         r = 3
         v.addWidget(self._field_label("日志类型"), r, 0)
         # 灰底容器，内部每个日志选项一张白色圆角容器，横向分隔
@@ -1421,6 +1771,12 @@ class DeviceTab(QWidget):
         gray_w = QWidget(); gray_w.setLayout(gl)
         v.addWidget(gray_w, r, 1, 1, 5)
         r += 1
+
+        # 固件设备行放在「手机日志」下方；这里只把它的启用状态跟固件来源绑定：
+        # 手机日志里也含固件，勾了它 PC 端照样会补齐从设备。
+        self._pack_checks["firmware"].toggled.connect(self._sync_fw_row_enabled)
+        self.chk_mobile.toggled.connect(self._sync_fw_row_enabled)
+        self._sync_fw_row_enabled(self._fw_row_needed())
 
 
         # --- 筛选方式：与整张表单对齐，左侧字段标签 + 右侧下拉/时间段同一行，切换自动显隐 ---
@@ -1705,6 +2061,7 @@ class DeviceTab(QWidget):
         self._scan_worker = BleScanWorker()
         self._scan_worker.result.connect(self._on_scan_result)
         self._scan_worker.failed.connect(self._on_scan_fail)
+        self._scan_worker.note.connect(self.log)
         self._scan_worker.finished.connect(lambda: self.btn_scan.setEnabled(True))
         self._scan_worker.start()
 
@@ -1748,9 +2105,10 @@ class DeviceTab(QWidget):
     def _set_ble_state(self, text):
         self.lbl_ble_state.setText(text)
         low = text.lower()
-        if "失败" in text or "error" in low:
+        # 配网成功后状态行只留 IP：只写一个网段的数字串不会被误当成 ipv6 变蓝
+        if "失败" in text or "error" in low or "ipv6" in low:
             color = "#dc2626"
-        elif "成功" in text or "已联网" in text or "ip" in low:
+        elif "成功" in text or "已联网" in text or "ip =" in low:
             color = "#16a34a"
         elif "中" in text or "已等" in text:
             # 进度态（连接中/配网中/等待设备联网…已等 N/40 秒）用蓝色，
@@ -1854,11 +2212,12 @@ class DeviceTab(QWidget):
             # worker 只在成功时 emit done，空 IP 属于不该发生的情况；按失败处理
             self._on_provision_fail("配网结束时未拿到设备 IP，请重试")
             return
-        self._set_ble_state(f"已联网 · IP = {ip}")
+        self._set_ble_state(ip)
         self._append(f"配网成功，设备 IP = {ip}")
         self.log(f"配网成功: 设备 IP = {ip}")
-        # 自动回填到② 合并分组的设备 IP，方便直接使用
-        self.edit_ip.setText(ip)
+        # 记下配网拿到的 IP：导出时作为首选目标（SDK 仍会 List 整个局域网）。
+        # 只在界面上留一行日志，不额外占表单位置。
+        self._device_ip = ip
 
     def _on_provision_fail(self, msg):
         """配网失败：红色状态 + 弹窗。
@@ -1871,7 +2230,83 @@ class DeviceTab(QWidget):
         self.log(f"配网失败: {msg}")
         QMessageBox.critical(self, "配网失败", str(msg))
 
-    # ------------------------------------------------------------- 远端一键导出
+    # ------------------------------------------------------------- 固件设备选择
+    def _refresh_fw_mode_label(self):
+        """刷新「固件设备」行的说明文字，让用户一眼看出当前按什么导。"""
+        if not hasattr(self, "lbl_fw_mode"):
+            return
+        if self._fw_serials:
+            self.lbl_fw_mode.setText(
+                f"手动指定 {len(self._fw_serials)} 台：" + "、".join(self._fw_serials))
+            self.lbl_fw_mode.setStyleSheet("color:#222;")
+            self.btn_fw_auto.setVisible(True)
+        else:
+            self.lbl_fw_mode.setText(
+                "自动：优先导出历史上常导的设备（其次按网络延迟），"
+                f"最多 {_max_network_devices(relay_config) or '全部'} 台")
+            self.lbl_fw_mode.setStyleSheet("color:#6b7280;")
+            self.btn_fw_auto.setVisible(False)
+
+    def _fw_row_needed(self) -> bool:
+        """「固件设备」这行是否有意义：勾了设备固件日志，或勾了手机日志（里面也含固件）。"""
+        fw_chk = (self._pack_checks or {}).get("firmware")
+        return bool((fw_chk is not None and fw_chk.isChecked())
+                    or getattr(self, "chk_mobile", None) is not None
+                    and self.chk_mobile.isChecked())
+
+    def _sync_fw_row_enabled(self, _checked=None):
+        """没有勾任何会拉固件的来源时，这行选择没有意义，置灰掉。"""
+        on = self._fw_row_needed()
+        for w in (getattr(self, "btn_fw_pick", None),
+                  getattr(self, "btn_fw_auto", None),
+                  getattr(self, "lbl_fw_mode", None)):
+            if w is not None:
+                w.setEnabled(on)
+
+    def _reset_firmware_devices(self):
+        self._fw_serials = []
+        self._refresh_fw_mode_label()
+        self.log("固件设备：恢复自动模式（历史优先）")
+
+    def _pick_firmware_devices(self):
+        """打开设备勾选对话框；确认后记录手动选择。"""
+        if self._fw_scan and self._fw_scan.isRunning():
+            self.log("设备列表正在扫描中，请稍候…")
+            return
+        self.btn_fw_pick.setEnabled(False)
+        self.btn_fw_pick.setText("扫描中…")
+        self.log("正在枚举设备（含导出历史）…")
+        self._fw_scan = FirmwareDeviceScanWorker(self._current_sdk_root())
+        self._fw_scan.result.connect(self._on_fw_scan)
+        self._fw_scan.failed.connect(self._on_fw_scan_fail)
+        self._fw_scan.finished.connect(self._on_fw_scan_finished)
+        self._fw_scan.start()
+
+    def _on_fw_scan_finished(self):
+        self.btn_fw_pick.setEnabled(True)
+        self.btn_fw_pick.setText("选择设备…")
+
+    def _on_fw_scan_fail(self, msg):
+        self.log(f"设备枚举失败：{msg}")
+        QMessageBox.warning(self, "枚举失败", f"无法获取设备列表：\n{msg}")
+
+    def _on_fw_scan(self, devices):
+        from ego_relay import orbbec_sdk
+        mem = orbbec_sdk.load_device_memory()
+        if not devices:
+            QMessageBox.information(
+                self, "没有设备", "当前没有枚举到任何设备。\n"
+                "请确认设备已上电并与电脑在同一网络，或已用 USB 连上。")
+            return
+        dlg = FirmwareDevicePicker(self, devices, mem, self._fw_serials)
+        if dlg.exec() == QDialog.Accepted:
+            self._fw_serials = dlg.selected_serials()
+            self._refresh_fw_mode_label()
+            if self._fw_serials:
+                self.log("固件设备：手动指定 " + "、".join(self._fw_serials))
+            else:
+                self.log("固件设备：未勾选任何设备，将按自动模式导出")
+
     def _pick_local(self):
         d = QFileDialog.getExistingDirectory(self, "选择本地保存目录")
         if d:
@@ -1942,10 +2377,11 @@ class DeviceTab(QWidget):
             stage_kwargs=filters,
             auto_import=self.chk_import.isChecked(),
             auto_report=self.chk_report.isChecked(),
-            device_host=self.edit_ip.text().strip(),
+            device_host=self._device_ip,
             sdk_port=relay_config.ORBBEC_SDK_PORT,
             sdk_root=self._current_sdk_root(),
-            mobile_serials=mobile_serials)
+            mobile_serials=mobile_serials,
+            firmware_serials=self._fw_serials)
         self._export_worker.progress.connect(self._progress_ui.set_value)
         self._export_worker.status.connect(self._append)
         self._export_worker.done.connect(self._on_export_done)
@@ -1979,7 +2415,7 @@ class DeviceTab(QWidget):
 
         # 固件日志要经网络拉取时，先确认设备真的在线：一次 ping 失败就报
         # "设备不在线"，比等 180 秒超时有用得多。
-        host = self.edit_ip.text().strip()
+        host = self._device_ip
         if not host:
             return True
         try:
@@ -2026,6 +2462,9 @@ class DeviceTab(QWidget):
     def _on_export_fail(self, err):
         self._append(f"[错误] 一键导出失败: {err}")
         self.log(f"一键导出失败: {err}")
+        # 失败也是任务结束：进度条停在失败时的百分比会让人以为还在跑，
+        # 必须和取消/完成一样清空（finished 信号随后只恢复按钮）。
+        self._reset_progress()
         # 若因时间段内无日志而失败：主动询问是否放宽到"全部日志"再试，避免卡在死路上。
         if "内未找到任何日志" in str(err):
             ret = QMessageBox.question(
@@ -2385,9 +2824,10 @@ class DeviceTab(QWidget):
             stage_kwargs=filters,
             auto_import=self.chk_import.isChecked(),
             auto_report=self.chk_report.isChecked(),
-            device_host=self.edit_ip.text().strip(),
+            device_host=self._device_ip,
             sdk_port=relay_config.ORBBEC_SDK_PORT,
-            sdk_root=self._current_sdk_root())
+            sdk_root=self._current_sdk_root(),
+            firmware_serials=self._fw_serials)
         self._pack_worker.progress.connect(self._progress_ui.set_value)
         self._pack_worker.status.connect(self._append)
         self._pack_worker.done.connect(self._on_pack_done)
@@ -2417,6 +2857,7 @@ class DeviceTab(QWidget):
     def _on_pack_fail(self, err):
         self._append(f"[错误] 打包失败: {err}")
         self.log(f"本地日志打包失败: {err}")
+        self._reset_progress()
 
     def _on_pack_cancelled(self):
         self._reset_progress()
@@ -2452,7 +2893,13 @@ class DeviceTab(QWidget):
             self._append("已请求取消 SSH 拉取任务")
             self.log("已取消 SSH 拉取任务")
         else:
-            self.log("当前没有运行中的导出任务")
+            # 上一轮任务已因失败结束：worker 线程没了，但进度条停在失败那一刻的值
+            # （_on_export_fail 只写日志、不复位界面），此时点「取消任务」必须能把
+            # 界面复位，否则进度条永远卡着，用户以为任务还在跑。
+            self._reset_progress()
+            self._on_export_finished()
+            self._append("上一轮任务已结束，进度条已清空")
+            self.log("当前没有运行中的导出任务（已清空残留进度）")
 
     # ------------------------------------------------------------- 日志
     def _append(self, text):

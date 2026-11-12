@@ -21,6 +21,7 @@ from ego_relay import config as relay_config
 class BleScanWorker(QThread):
     result = Signal(list)
     failed = Signal(str)
+    note = Signal(str)   # 扫描过程中的说明（如放宽条件重试）
 
     def run(self):
         try:
@@ -30,7 +31,8 @@ class BleScanWorker(QThread):
                     "未找到 EgoLowBle.dll。便携版应自带 lib\\EgoLowBle.dll——"
                     "请确认解压完整（不是只拷了 exe），或安装 EGOViewer 后重试。")
                 return
-            self.result.emit(ble_provision.scan_devices())
+            self.result.emit(
+                ble_provision.scan_devices_robust(status_cb=self.note.emit))
         except Exception as e:  # noqa: BLE001
             self.failed.emit(str(e))
 
@@ -218,6 +220,7 @@ class ExportTab(QWidget):
         self._ble_scan_worker = BleScanWorker()
         self._ble_scan_worker.result.connect(self._on_ble_scan)
         self._ble_scan_worker.failed.connect(self._on_ble_fail)
+        self._ble_scan_worker.note.connect(self.log)
         self._ble_scan_worker.finished.connect(
             lambda: self.btn_ble_scan.setEnabled(True))
         self._ble_scan_worker.start()

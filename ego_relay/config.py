@@ -36,6 +36,11 @@ DB_PATH = DATA_ROOT / "ego_relay.db"
 EXPORT_DIR = DATA_ROOT / "exports"
 IMPORT_TMP = DATA_ROOT / "tmp_import"
 THRESH_FILE = DATA_ROOT / "thresholds.json"
+# 固件日志导出过的设备记忆：{serial: {"count": n, "last": "YYYY-MM-DD HH:MM:SS",
+#                                        "name": "...", "ip": "..."}}
+# 用于「优先导出上次用过的设备」——按延迟猜远近并不可靠（同一交换机内几毫秒差异
+# 纯属抖动），用户真正想要的是他反复在用的那几台。
+FIRMWARE_DEVICE_MEMORY = DATA_ROOT / "firmware_devices.json"
 for _p in (EXPORT_DIR, IMPORT_TMP):
     _p.mkdir(parents=True, exist_ok=True)
 
@@ -88,10 +93,18 @@ EGOLOWBLE_DLL = ""
 
 # 配网协议限制（见 EGOViewer 手册）：Wi-Fi 名称与密码各最多 32 个 UTF-8 字节。
 BLE_WIFI_MAX_BYTES = 32
-BLE_CONNECT_TIMEOUT_S = 20      # 连接/配网等待超时（秒）
-BLE_SCAN_TIMEOUT_S = 5          # 扫描 BLE 设备的等待超时（秒），越短扫描越快
+BLE_CONNECT_TIMEOUT_S = 15      # 连接/配网等待超时（秒）
+# 扫描 BLE 设备的单次等待（秒）。EgoLowBle 的扫描是「阻塞到超时才返回」，
+# 超时多长就等多久（实测 5s → 5.0s、2s → 2.1s，设备数量基本一样）。
+# 2 秒已能覆盖附近全部设备，配合「扫不到再补扫」既快又不漏。
+BLE_SCAN_TIMEOUT_S = 2.0
 BLE_SCAN_RSSI_MIN = -70         # 扫描时丢弃信号弱于该值(dBm)的设备（距离过远）
 BLE_NETWORK_JOIN_TIMEOUT_S = 40 # 配置后等待设备加入局域网并上报 IP 的超时（秒）
+
+# 固件日志导出时，以太网（非 USB 直连）设备最多拉几台。单台固件日志往往要
+# 十几秒到一分钟，一网段七八台会把整次导出拖到几分钟。按 ping 延迟从快到慢取。
+# USB 直连设备不受此限制。设为 0 或负数表示不限制。
+FIRMWARE_MAX_NETWORK_DEVICES = 3
 
 
 # ---------------------------------------------------------------------------

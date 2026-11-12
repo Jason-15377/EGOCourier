@@ -43,6 +43,20 @@ class TestSourceKind(unittest.TestCase):
         meta = json.dumps({"files": [{"file": "firmware/EGOPro/orbbec.log"}]})
         self.assertEqual(sv.source_kind(_s(source_path=r"D:\a\b", meta=meta)), "电脑端导出")
 
+    def test_flat_mobile_device_group_indicates_phone(self):
+        """平铺展开后的手机设备分组 <机型>/<SN>-<时间戳>/ 应识别为手机日志。"""
+        meta = json.dumps({"files": [
+            {"file": "Pixel 7/AZL9861004V-20261109_153234_206-6f342b60/orbbec_2026-11-09.log"}]})
+        self.assertEqual(sv.source_kind(_s(source_path=r"D:\out\EGO_export_20261110_102103",
+                                           meta=meta)), "手机日志")
+
+    def test_flat_usb_device_group_not_marked_phone(self):
+        """USB 拉取的 <设备名_序列号>/<时间戳>/ 不能被误判成手机日志。"""
+        meta = json.dumps({"files": [
+            {"file": "EGOPro_AZL9861004V/20261110-102103/orbbec_2026-11-09.log"}]})
+        self.assertNotEqual(sv.source_kind(_s(source_path=r"D:\out\EGO_export_20261110_102103",
+                                              meta=meta)), "手机日志")
+
 
 class TestBatchLabel(unittest.TestCase):
     def test_ego_export_gets_human_label(self):
