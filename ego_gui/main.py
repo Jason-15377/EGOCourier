@@ -134,20 +134,18 @@ def _set_app_user_model_id() -> None:
         pass
 
 
-def _ensure_database() -> None:
-    """建库建表（幂等）。
+def _ensure_data_root() -> None:
+    """确保运行数据目录存在（导出目录、分析日志等）。
 
-    会话列表等页签在构造时就会查 sessions 表，因此必须在 MainWindow 之前调用；
-    否则全新机器 / 打包后首次运行时数据库文件尚不存在，界面会直接抛
-    ``no such table: sessions``。
+    分析已改为整目录分析、结果只有 HTML 报告，不再有会话数据库；
+    这里只保证 EGO Courier 的 data 根目录可写。
     """
-    from ego_relay import config, db
+    from ego_relay import config
 
     try:
         config.DATA_ROOT.mkdir(parents=True, exist_ok=True)
     except Exception:
         pass
-    db.init_db()
 
 
 def main() -> int:
@@ -155,7 +153,7 @@ def main() -> int:
     from ego_relay import deps
     deps.ensure_ffmpeg_on_path()
 
-    _ensure_database()
+    _ensure_data_root()
     _set_app_user_model_id()
 
     app = QApplication(sys.argv)

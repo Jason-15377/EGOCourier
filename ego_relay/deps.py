@@ -1,7 +1,7 @@
 """运行依赖检测：ffmpeg/ffprobe、mcap、numpy 是否可用，以及安装指引。
 
-日志/CSV 分析（EGO 管道）不依赖第三方，开箱即用；
-视频分析（video_analyzer 处理 MP4/MCAP）需要 ffmpeg/ffprobe（必需）与 mcap（可选）。
+日志分析（内嵌 ego_checker 引擎）读取 CSV / MCAP / WAV 不依赖 ffmpeg；
+视频 SEI 提取与帧截取需要 ffmpeg/ffprobe（可选），MCAP 压缩流需要 lz4/zstandard。
 """
 
 from __future__ import annotations
@@ -36,8 +36,8 @@ def has_ffmpeg() -> bool:
 def ensure_ffmpeg_on_path() -> None:
     """若 ffmpeg/ffprobe 不在当前进程 PATH 中，把 winget 安装的 bin 目录加进 PATH。
 
-    目的：无论应用如何启动（终端旧 PATH / 新装 ffmpeg 后），video_analyzer 调用
-    ffmpeg/ffprobe 子进程时都能找到，避免“装了却仍提示未安装”。
+    目的：无论应用如何启动（终端旧 PATH / 新装 ffmpeg 后），日志分析的 SEI 提取
+    与帧截取调用 ffmpeg/ffprobe 子进程时都能找到，避免“装了却仍提示未安装”。
     """
     if shutil.which("ffmpeg") and shutil.which("ffprobe"):
         return

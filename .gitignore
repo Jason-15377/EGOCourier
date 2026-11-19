@@ -25,3 +25,7 @@ dist/
 dist_onefile/
 *.tar.gz
 *.manifest
+
+# ---- 调试截图（根目录下划线开头） ----
+_*.png
+_*.bmp

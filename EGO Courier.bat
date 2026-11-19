@@ -5,7 +5,7 @@ REM
 REM  First run on a new PC: creates .venv and installs dependencies
 REM  automatically, then starts the GUI. Nothing is installed globally.
 REM
-REM  Finds Python 3.10-3.12 first: PySide6 / matplotlib have no
+REM  Finds Python 3.10-3.12 first: PySide6 has no
 REM  wheels for 3.13+, which is the usual cause of a wall of red errors.
 REM ===================================================================
 setlocal EnableExtensions
@@ -62,7 +62,7 @@ echo.
 echo  --------------------------------------------------------------
 echo   [!] Python is installed, but the version is too new.
 echo.
-echo   PySide6 / matplotlib do not ship prebuilt wheels for Python
+echo   PySide6 does not ship prebuilt wheels for Python
 echo   3.13 and later, so installing dependencies would flood this
 echo   window with red errors. EGO Courier needs Python 3.10-3.12.
 echo.

@@ -16,9 +16,8 @@ from ego_relay import config
 
 from . import resources
 from .device_tab import DeviceTab
-from .sessions_tab import SessionsTab
 from .analysis_tab import AnalysisTab
-from .trace_tab import TraceTab
+from .history_tab import HistoryTab
 
 # 全局 QSS：与 Web 版统一（浅色顶栏 + 蓝色激活下划线 + 浅灰内容区 + 白色表格，简洁干净）
 QSS_TEMPLATE = """
@@ -41,6 +40,13 @@ QPushButton[role="danger"]  { background:#f97316; color:#ffffff; border-color:#f
 QPushButton[role="danger"]:hover  { background:#ea580c; }
 QPushButton[role="stop"]    { background:#e5e7eb; color:#374151; border-color:#d1d5db; }
 QPushButton[role="stop"]:hover    { background:#d1d5db; }
+/* ---- 分析方式：分段按钮（不使用单选圆点） ---- */
+QPushButton#modeSwitch { padding:0 18px; border:1px solid #d1d5db; border-radius:6px;
+  background:#ffffff; color:#4b5563; }
+QPushButton#modeSwitch:hover { border-color:#93c5fd; color:#2563eb; }
+QPushButton#modeSwitch:checked { border-color:#2563eb; color:#2563eb; background:#eff6ff;
+  font-weight:600; }
+QPushButton#modeSwitch:checked:hover { background:#dbeafe; }
 /* ---- 输入框 ---- */
 QLineEdit, QPlainTextEdit, QComboBox { background:#ffffff; border:1px solid #d1d5db;
   border-radius:4px; padding:5px 7px; }
@@ -112,8 +118,7 @@ QRadioButton::indicator { border-radius:8px; }
 QCheckBox::indicator:hover, QRadioButton::indicator:hover {
   border-color:#2563eb; }
 QCheckBox::indicator:checked { image:url("__CHECK_SVG__"); }
-QRadioButton::indicator:checked { background:#2563eb; border:4px solid #ffffff;
-  outline:1px solid #2563eb; }
+QRadioButton::indicator:checked { background:#ffffff; border:3px solid #2563eb; }
 QCheckBox::indicator:disabled, QRadioButton::indicator:disabled {
   background:#f3f4f6; border-color:#d1d5db; }
 /* ---- 下拉列表弹层 / 右键菜单 / 提示条 ----
@@ -224,6 +229,14 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(STYLE)
         self._build_ui()
 
+    def closeEvent(self, event) -> None:
+        """关窗前先协作式停止后台分析，避免 Qt 在事件循环退出时销毁运行中的线程。"""
+        if not self.analysis_tab.stop_for_close():
+            event.ignore()
+            self.log("后台分析尚未在时限内结束，已取消关闭；请稍后重试")
+            return
+        super().closeEvent(event)
+
     def _build_ui(self) -> None:
         central = QWidget()
         self.setCentralWidget(central)
@@ -243,14 +256,12 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.setTabBar(FullWidthTabBar(self.tabs))
         self.device_tab = DeviceTab(self.log, self.log_box)
-        self.sessions_tab = SessionsTab(self.log)
         self.analysis_tab = AnalysisTab(self.log)
-        self.trace_tab = TraceTab(self.log)
+        self.history_tab = HistoryTab(self.log)
         for tab, title in (
             (self.device_tab, "日志导出"),
-            (self.sessions_tab, "会话记录"),
             (self.analysis_tab, "日志分析"),
-            (self.trace_tab, "Trace 查询"),
+            (self.history_tab, "会话记录"),
         ):
             self.tabs.addTab(tab, title)
 
@@ -264,14 +275,13 @@ class MainWindow(QMainWindow):
         self.tabs.setCurrentWidget(self.device_tab)
         self.tabs.tabBar().setFocusPolicy(Qt.NoFocus)
 
-        # 跨页联动
-        # 日志分析完成 → 刷新会话记录列表（会话记录页保留，可在其中打开详情）
-        self.analysis_tab.imported.connect(lambda _sid: self.sessions_tab.refresh_list())
-        # 在会话记录页打开刚分析的会话
-        self.analysis_tab.open_in_sessions.connect(self._open_session)
-        # 设备工作台一键导出/本地导入成功 → 刷新并打开新会话
-        self.device_tab.imported.connect(lambda _sid: self.sessions_tab.refresh_list())
-        self.device_tab.imported.connect(self._open_session)
+        # 日志导出完成 → 把本次导出目录预填到「日志分析」页并切过去（不自动开始）。
+        self.device_tab.analyze_requested.connect(self._goto_analysis)
+        # 分析页每完成一次就落一条历史；「会话记录」页反向跳回分析页重跑。
+        self.analysis_tab.history_recorded.connect(self._on_history_recorded)
+        self.analysis_tab.status_message.connect(self._set_status)
+        self.history_tab.open_analysis_requested.connect(self._goto_analysis)
+        self.history_tab.status_message.connect(self._set_status)
 
         root.addWidget(self.tabs, stretch=1)
 
@@ -282,7 +292,17 @@ class MainWindow(QMainWindow):
         self.status_label = QLabel("就绪")
         self.status.addPermanentWidget(self.status_label)
 
-        self.log("EGO Courier 桌面版已启动（日志导出/会话记录/日志分析/Trace 查询）")
+        self.log("EGO Courier 桌面版已启动（日志导出/日志分析/会话记录）")
+
+    def _set_status(self, text: str) -> None:
+        self.status_label.setText(text or "就绪")
+
+    def _on_history_recorded(self, session_id: str) -> None:
+        """分析完工并把记录写入历史后，刷新记录页（不强行切页，避免打断分析结果查看）。"""
+        try:
+            self.history_tab.refresh_silently()
+        except Exception as exc:  # noqa: BLE001 —— 历史刷新失败不能影响分析主流程
+            self.log(f"刷新会话记录失败：{exc}")
 
     def _current_tab_order(self) -> list:
         """按当前显示顺序返回 Tab 标题列表。"""
@@ -304,6 +324,10 @@ class MainWindow(QMainWindow):
         """拖拽重排后把当前顺序写回配置文件。"""
         _save_tab_order(self._current_tab_order())
 
-    def _open_session(self, session_id: int) -> None:
-        self.sessions_tab.open_session(session_id)
-        self.tabs.setCurrentWidget(self.sessions_tab)
+    def _goto_analysis(self, path: str) -> None:
+        """切到「日志分析」页并预填数据目录（等待用户点开始分析）。"""
+        try:
+            self.analysis_tab.set_root(path)
+        except Exception:  # noqa: BLE001
+            pass
+        self.tabs.setCurrentWidget(self.analysis_tab)

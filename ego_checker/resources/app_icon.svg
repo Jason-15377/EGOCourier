@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <title>EGOChecker C Pulse icon</title>
+  <rect width="256" height="256" rx="56" fill="#0F172A"/>
+  <path d="M185 73 C169 56 147 47 123 47 C78 47 46 81 46 127"
+        fill="none" stroke="#38BDF8" stroke-width="30" stroke-linecap="round"/>
+  <path d="M46 127 C46 171 78 205 123 205"
+        fill="none" stroke="#2563EB" stroke-width="30" stroke-linecap="round"/>
+  <path d="M123 205 C148 205 170 196 186 179"
+        fill="none" stroke="#818CF8" stroke-width="30" stroke-linecap="round"/>
+  <circle cx="194" cy="75" r="8" fill="#E0F2FE"/>
+  <circle cx="194" cy="179" r="8" fill="#E0E7FF"/>
+</svg>

@@ -1,31 +1,58 @@
 # EGO Courier
 
-轻量日志中转网关：把 EGO 多设备的**硬件 PTP 时间戳、EGOViewer 应用日志、MP4 视频帧内时间戳、IMU** 四类日志收拢到一个工具里，自动按帧对齐、计算两两时间戳差值、超过阈值标记异常，桌面查询 + 一键打包导出。
+EGO 采集日志的收发与完整性分析工具：从设备 / EGOViewer / 手机收拢日志，并对录制目录做时间同步、丢帧、音频与元数据完整性分析，输出自包含 HTML 报告。
 
-前端为 **PySide6 桌面 GUI**，另附命令行工具：
+前端为 **PySide6 桌面 GUI**：
 
 | 形态 | 入口 | 说明 |
 |---|---|---|
-| **桌面版** | `EGO Courier.bat` 或 `python run_desktop.py` | PySide6 桌面 GUI：日志导出工作台（BLE 配网、EGOViewer 三类日志一键导出 / 勾选导出）+ 会话记录 / 日志分析 / Trace 查询 |
-| **命令行** | `ego <子命令>` 或 `python -m ego_relay.cli` | 导入/查询/导出/阈值/WiFi 等（`ego.bat` 是对应的批处理包装） |
+| **桌面版** | `EGO Courier.bat` 或 `python run_desktop.py` | PySide6 桌面 GUI：**日志导出**（BLE 配网 + EGOViewer 三类日志一键导出 / 打包）+ **日志分析**（整目录完整性分析 + 自包含 HTML 报告）+ **会话记录**（分析历史留存与回看） |
 | **便携版** | `EGO Courier.exe`（见 [GitHub Releases](https://github.com/Jason-15377/EGOCourier/releases)） | 自带 Python 与全部依赖，目标机器无需安装任何东西；解压即用 |
 
-**纯 Python 实现**。核心包零第三方依赖（stdlib）；桌面版依赖 PySide6、matplotlib、numpy、paramiko、mcap（清单见 `requirements.txt`）。
+**纯 Python 实现**。设备导出部分零第三方依赖（stdlib）；桌面版依赖 PySide6、numpy、paramiko、mcap、lz4、zstandard（清单见 `requirements.txt`）。
 
-桌面 GUI 共四个页签：**日志导出**（BLE 配网 + EGOViewer 三类日志收集 / 勾选打包）、**会话记录**（多选删除 / 对比 / 导出汇总）、**日志分析**（对齐 + 异常检测 + 可视化）、**Trace 查询**。
+桌面 GUI 共三个页签：**日志导出**（BLE 配网 + EGOViewer 三类日志收集 / 打包）、**日志分析**（选择目录 → 整目录分析 → HTML 报告）、**会话记录**（每次分析的归档，可筛选、回看、重跑或删除记录）。
+
+## 日志分析
+
+「日志分析」页内嵌 EGOChecker 分析引擎（源码位于 `ego_checker/`），一次分析读取所选目录下的**全部**采集数据：
+
+- CSV：相机 / IMU / 夹爪等时间戳 CSV（`*_pts.csv`、`camera_*.csv`、`imu*.csv`…）；
+- 视频：目录内的 MP4 与 MCAP 录制（相机视频流、传感器流；SEI 时间戳提取）；
+- 音频：WAV 文件及其配套 CSV；
+- 元数据：`meta_*.json` 完整性与准确性。
+
+分析项：相机帧数对齐、帧间隔波动、同行对齐、相机同步、IMU 同步、RGB 丢帧、IMU 丢帧/倒退、音频时长与包完整性、元数据完整性；跨录制段做边界比对。结果**只输出一份自包含 HTML 报告**（不再写数据库、不再生成结果 CSV 或额外证据目录）。
+
+参数区（与整机其它页签同一套浅色风格）按业务分组：会话与文件（单设备/多设备、落盘格式、配对等级、并发）、检查项（Depth / SEI / 音频 / 元数据）、阈值（自适应或固定输入）、帧截取（不同步帧 / 同步帧截取）。支持暂停 / 停止（停止仍出部分报告），分析完成后可「打开 HTML 报告」「打开输出文件夹」，双击结果单元格查看异常明细。
+
+「日志导出」完成一键导出后，会把本次导出目录预填到「日志分析」页，切换过去点「开始分析」即可。
+
+### 定时分析
+
+「日志分析」页顶部可在**目录分析**与**定时分析**之间切换：
+
+- 定时分析支持「每天 HH:MM」或「仅一次 YYYY-MM-DD HH:MM」；到点自动用保存时的参数快照启动分析；
+- 定时数据目录是一个**列表**，可添加多个目录，按列表顺序逐个分析；每个目录写入独立时间戳输出目录；
+- 支持错过补跑（默认 2 小时内），程序启动或电脑睡眠唤醒后仍会按真实时间判断；
+- 「启用定时分析」勾选时自动保存当前目录列表与参数；「保存定时设置」可更新规则/参数快照；「暂停定时」立即停用但保留配置；
+- 定时运行结束会写入「会话记录」，备注标记为「定时任务」；与手动分析共用同一套结果表和 HTML 报告；多目录批次在「上次运行」里显示成功目录数，悬停可看每个目录的结果；
+- 配置保存在 `data/analysis_schedule.json`，同一时间只允许一个 EGO Courier 实例执行定时（`QLockFile`），避免重复跑。
+
+注意：定时分析依赖 EGO Courier 进程保持运行（窗口可最小化，但不要退出）；关闭程序后定时不会触发。不使用时可随时切回「目录分析」，原手动流程不变。
 
 ## 桌面版（GUI）说明
 
 ## 桌面版（GUI）说明
 
-**环境要求：Python 3.10–3.12（推荐 3.12）。** 3.13 及以上暂无 PySide6 / matplotlib
+**环境要求：Python 3.10–3.12（推荐 3.12）。** 3.13 及以上暂无 PySide6
 预编译包，装依赖会失败——启动器会提前拦下并提示改用 3.12。
 
 依赖安装：**首次启动自动完成**。双击 `EGO Courier.bat` 后，启动器会自己完成：
 
 1. 找到本机的 Python（优先 3.12 / 3.11 / 3.10）；
 2. 在本目录建独立环境 `.venv`（不污染系统 Python）；
-3. 按 `requirements.txt` 只补装缺失的依赖（约 200MB，1–10 分钟）；
+3. 按 `requirements.txt` 只补装缺失的依赖（约 150MB，1–10 分钟）；
 4. 启动界面。之后再启动会跳过以上步骤，直接打开。
 
 装不上时窗口**不会闪退**，会给出中文原因（Python 版本过新 / 网络不通 / 无写入权限 /
@@ -54,22 +81,12 @@ python bootstrap.py --reinstall      :: 强制重装全部依赖
 python bootstrap.py --system-python  :: 不用 .venv，直接用系统 Python
 ```
 
-- **日志分析 Tab**（导入 + 综合分析 + 可视化，功能化布局、无“概览/KPI 卡片”风格）：
-  - 选择本地日志文件夹或 zip → 开始分析。后台同时跑两条管线：
-    - **EGO 管道**：解析 SEI/MP4-pts/IMU/EGOViewer 日志并对齐、落库（可在「会话记录」查看）；
-    - **video_analyzer**：处理目录内 MP4/MCAP/*_pts.csv，做 SEI 比对、丢帧、左右 Color 同步、IMU 同步。
-  - 结果按功能分页展示：**丢帧检测**（曲线图 + 丢帧明细表）、**左右 Color 同步**（曲线图 + 配对/未配对表）、**SEI vs CSV 比对**、**IMU 同步**、**帧统计**、**来源文件**。
-  - 工具栏：导出 HTML 报告、导出 zip。
-  - **可取消**：分析过程中可点「取消」停止。
-  - **结果缓存**：同一目录/日志未变化时复用上次结果（来源签名比对），跳过耗时重算。
-  - **数据校验**：自动剔除并统计“垃圾时间戳”（帧号被误当 us 等），在「帧统计」与报告中展示，减少脏数据误判。
-  - 目录内无 MP4/MCAP 时自动回退到 EGO 会话数据（frame_entries）做同样的可视化，不报错。
-- **会话记录**：列表按**导出批次**组织——每次「开始一键导出」产生一条（同一来源目录重复分析就地更新，不新增）。列依次为 **导出批次 / 来源 / 设备 SN / 数据 / 帧数 / 异常 / trace_id / 导出时间**：「来源」区分手机日志、电脑端导出、分析目录；「导出批次」把目录名翻译成时间点（如 `导出批次 2026-10-20 10:39:36`）；「设备 SN」只在解析出真实序列号时显示，否则标 `未识别`（不再拿会话名冒充设备）；「数据」标 `可对齐` / `仅日志`，0 帧的会话保留在列表但帧数显示 `无可对齐数据`、异常显示 `—`，表示这批日志只做留存、未参与时间戳对齐。支持**勾选多选 → 删除选中 / 对比选中 / 导出汇总报告**（横向对比帧数、丢帧、左右同步、IMU 同步、异常等）。
+- **日志分析 Tab**：选择本地录制目录 → 开始分析（后台线程，实时日志 + 进度，可暂停 / 停止）。分析读取目录内全部 CSV / MCAP / WAV / meta 数据，做同步、丢帧、音频、元数据与跨段边界检查，只生成一份自包含 HTML 报告。详见上文「日志分析」一节。
 - **设备与日志 Tab**：
   - ① 蓝牙配网：扫描 BLE 设备、「确认选择」、下发 Wi-Fi 接入局域网，自动回填设备 IP（例如 `10.9.82.9`）。**Wi-Fi 名称**直接用下拉选择电脑可见的 Wi-Fi（电脑当前连接会自动带出，可「搜索 Wi-Fi」刷新），再填密码。
-  - **② EGOViewer 日志导出**（三类日志统一收集，不再细分 app/sdk/firmware 勾选）：自动识别 EGOViewer 版本根目录，一键收集 app/sdk/firmware 三类日志。**开始一键导出**→ 每次在「输出目录」下新建**全新时间戳目录** `EGO_export_YYYYMMDD_HHMMSS/`（内按 `app/ sdk/ firmware/` 子目录），不复用/混入本地旧日志；firmware 通过 Orbbec SDK（复用 EGOviewer 的 `OrbbecSDK.dll`）**从设备实时拉取最新固件日志**到 `firmware/`（设备需在线；设备离线/拉取失败则整体报错）；app/sdk 从 EGOViewer 根目录 `data\logs`、`Log` 收集。随后按选项自动导入分析 + 生成 HTML 报告。
+  - **② EGOViewer 日志导出**（三类日志统一收集，不再细分 app/sdk/firmware 勾选）：自动识别 EGOViewer 版本根目录，一键收集 app/sdk/firmware 三类日志。**开始一键导出**→ 每次在「输出目录」下新建**全新时间戳目录** `EGO_export_YYYYMMDD_HHMMSS/`（内按 `app/ sdk/ firmware/` 子目录），不复用/混入本地旧日志；firmware 通过 Orbbec SDK（复用 EGOviewer 的 `OrbbecSDK.dll`）**从设备实时拉取最新固件日志**到 `firmware/`（设备需在线；设备离线/拉取失败则整体报错）；app/sdk 从 EGOViewer 根目录 `data\logs`、`Log` 收集。导出后可在「日志分析」页对该目录做完整性分析。
   - **勾选导出**（手动精确打包）：同样收集三类日志，可选筛选范围（**时间段（起~止）**、**手动勾选具体日志文件**——弹出对话框按分类勾选，可按文件名时间戳精确取某次会话，防止不同会话日志混包导致分析不同步），打包成日期时间命名 zip（`EGOViewer_logs_YYYYMMDD_HHMMSS.zip`）；原始日志不改动；若未来版本调整目录结构，会按文件名模式回退搜索以兼容。
-  - 两类导出共用「输出目录」与「选项」（导出后自动导入分析 / 自动生成 HTML 报告）。
+  - 两类导出共用「输出目录」与「选项」（导出后可在「日志分析」页分析该目录）。
   - **EGOViewer 手机日志**（② 分组内的一行勾选项，Android / adb 通道）：**勾选即自动扫描**已连接并授权的手机并在下拉框列出（取消勾选再勾回不会重复扫描；未勾选时下拉框显示灰色提示语），随后与固件日志一起由「开始一键导出」统一导出。**导出目录平铺，不区分来源**：
     ```
     EGO_export_YYYYMMDD_HHMMSS/
@@ -78,8 +95,7 @@ python bootstrap.py --system-python  :: 不用 .venv，直接用系统 Python
     ```
     手机侧只拉**最新一个**导出包（不拉历史包，避免目录里堆满重复内容），压缩包原样不拆。固件日志有两条落盘路径，都会解析并计入设备分组：zip 内的 `firmware/<SN>-.../`（或 `firmware/persisted/<SN>-.../`）以及手机侧持久化目录 `固件日志/<SN>-.../`——App 有时把 zip 落在私有 cache（adb 读不到），此时后者是唯一完整副本。勾选手机日志时以手机产物提供固件日志，不再从电脑 USB 重复拉取。注意：手机只拉「导出那一刻仍能导出」的固件日志，设备断开后再导出该分组为空，需现场即时导出。
   - 三类日志分类勾选框默认：**app 不勾、sdk/firmware 勾**（可自行调整），「开始一键导出」与「勾选导出」共用同一组勾选框与输出目录。
-  - 手机日志与 app/sdk/firmware 共用同一套「**选项**」：拉取后自动导入分析 / 自动生成 HTML 报告。两个分组放进整页滚动区，内容不会被窗口裁切遮挡；操作栏（开始一键导出 / 勾选导出 / 取消 / 清空）与进度条统一在下方。
-- **日志分析 Tab**：除「选择目录…/zip…」外，新增「从 EGOViewer 导入」按钮——自动定位本机 EGOViewer 的 `data` 目录并直接分析（免 SSH，原「设备与日志」页的本地导入已合并至此）。
+  - 手机日志与 app/sdk/firmware 共用同一套「**选项**」（「先压缩再导出zip」：勾选后「开始一键导出」会在导出目录旁生成同名 `.zip`；导出目录保留，仍可直接用于「日志分析」）。两个分组放进整页滚动区，内容不会被窗口裁切遮挡；操作栏（开始一键导出 / 勾选导出 / 取消 / 清空）与进度条统一在下方。
 - 界面：浅灰商务科技风、按钮角色配色（执行=蓝、清空=橙、停止=灰）、表头加粗、表格隔行、底部日志框 `[HH:MM:SS] 级别｜信息`。
 - **设备日志协议**：GUI 的「② EGOViewer 日志导出」一键收集三类日志——app/sdk 从本机 EGOViewer 安装目录收集（`data\logs`、`Log`），firmware 通过 Orbbec SDK（复用 EGOviewer 的 `OrbbecSDK.dll`）从设备实时导出到 `firmware/`；「勾选导出」则从本机 EGOViewer 目录打包三类日志（含既有 `data\firmware-logs`）。设备端 SSH/SFTP 拉取 app 日志的通道暂未开通（代码保留，待后续启用）。
 
@@ -152,81 +168,60 @@ python assets\make_logo.py
 > 若 `assets\` 缺失（例如只拷了 `.py` 文件），程序会自动退回代码内绘制的矢量图标，
 > 窗口图标不会为空。
 
-## 命令行工具（ego）
+## 分析能力（内嵌 EGOChecker 引擎）
 
-```bat
-ego list                                                     列出会话
-ego import "D:\...\EGO_AK8896100BJ_20260915_143309"          导入目录/zip 并分析
-ego show 1                                                   会话详情 + 异常汇总
-ego query 1 --anomalies                                      查看会话 1 的异常
-ego query 1 --side left --anomaly-only                       查看左目异常帧
-ego export 1 -o out.zip                                      一键打包导出
-ego attach-log 1 "path\ego-viewer-2026-09-15.log"            把 EGOViewer app 日志关联进会话 1 并重算
-ego thresholds show                                          查看阈值
-ego thresholds set sei_copy_error=2000 app_receive_delay=50000  调整阈值(μs)
-ego wifi --scan                                          扫描 WiFi（SSID/信号/安全/连接状态）
-ego status                                                   健康检查
-ego evlog list                                              列出本机 EGOViewer 安装目录及各类日志数
-ego evlog export [-o 目录] [--days 7] [--report] [--root 根]  收集本地 EGOViewer 三类日志并打包 zip（可自动导入分析+报告）
-ego device pull ...                                        预留：设备 WiFi 导出（通道未配置）
-```
+日志分析引擎源码位于 `ego_checker/`，只保留分析内核（数据发现与读取、同步/丢帧检查、跨段边界、元数据完整性、HTML 报告生成），界面由 `ego_gui/analysis_tab.py` 提供，无独立 CLI。原分析流程（会话数据库、四类硬编码异常、Trace 查询、结果 CSV 导出、video_analyzer 独立脚本）已整体移除。
 
-## 异常自动截帧
+检查项（GUI 可勾选开关）：
 
-对每条异常，按**异常帧的硬件 PTP 时间戳**匹配会话目录里的 `frame_dumps/**/*.jpg`（文件名以 `_<hw_ptp_us>.jpg` 结尾、`_left_/_right_` 区分侧）：
-- 精确匹配 → 该采样帧；无精确时取最近且在 500ms 容差内的一帧。
-- 截帧随会话入库（`anomalies.frame_image`），桌面端异常列表显示缩略图，一键导出时打包进 `anomaly_frames/`，报告内也内嵌图片。
-- 说明：`frame_dumps` 是采样帧（非全帧），因此只有落在采样范围内的异常帧才有截图，属于预期行为。
+| 检查项 | 判定 |
+|---|---|
+| 相机帧数对齐 | 全部相机帧数相等且首/尾行时间戳差 < 1ms（D3B 分层判定） |
+| 帧间隔波动 | 每帧间隔与基准 expected=1/帧率 之差 < 阈值（默认 10ms） |
+| 同行对齐 | 同帧相机时间戳最大差值 < 阈值（默认 10ms） |
+| 相机同步 | 以各目为基准找最近邻，按 max 峰值分档 |
+| IMU 同步 | 以相机为基准匹配 IMU，按 max 峰值分档（默认 1ms） |
+| RGB 丢帧 | 帧间隔 > 1.5×基准 计丢帧 |
+| IMU 丢帧/倒退 | 正向超周期计丢帧，负间隔判倒退 |
+| 音频（WAV） | 时长、包完整性与连续性 |
+| 元数据完整性 | meta_*.json 必备区块/字段/分片/取值/跨文件一致 |
+| SEI 时间戳对齐（可选） | 视频 SEI 时间戳与相机 CSV 完全匹配 |
 
-## 关联 EGOViewer app 日志（attach-log）
-
-当会话只有 SEI/MP4/IMU（无 app 日志）时，可单独把 EGOViewer app 日志关联进来，获得 `trace_id(sessionId)` 和应用接收时刻，从而让 `app_receive_delay` 可计算：
-
-```bat
-ego attach-log <session_id> "D:\...\ego-viewer-2026-09-15.log"
-```
-
-或桌面端会话详情页点「关联 app 日志」输入路径。系统会把日志**复制进附件区**（不修改你原始数据），加入该会话的 `log_files` 并**就地重算**（同一会话更新，不新建）。重复关联同一文件幂等。
-
-> **已知限制（真实数据实测）**：EGOViewer app 日志里的 `frameIndex` 是**设备全局帧计数**，而 SEI 会话的 `frame_index` 是会话内相对编号，二者**不一定时间对齐**。因此只有当 app 日志片段与 SEI 会话属于**同一次录制（时间匹配）**时，`app_receive_delay` 才准确；若 app 日志与 SEI 不同录制时段，计算出的差值会很大并被标记为异常——这本身也能提示"日志与数据不匹配"。
-
-## 时间戳与真值基准
-
-- **真值基准 = 硬件 PTP `hw_ptp_ts`（epoch 微秒 UTC）**。所有来源统一归一化到微秒 epoch UTC。
-- 解析器字段名/单位**可配置**，同时兼容真实文件（`frame_index,timestamp_us`、单列 `timestamp_us`、`[2026-09-15 17:53:13.815 ...]`）与规格命名（`hw_ptp_ts`/ns、`sei_hw_ptp_ts`、`recv_hw_frame_idx`、`app_local_receive_ts`、`trace_id`）。时间戳单位自动按数量级判定（ns/us/ms）。
-
-### 关联链路（方案A 强关联）
-`EGOViewer.log(frameIndex)` → 匹配硬件 PTP 的 `frame_index` 拿 `hw_ptp_ts` → 再以 `hw_ptp_ts` 匹配 MP4 pts 的 `sei_hw_ptp_ts`。trace_id 取自应用日志 / 会话级。
-
-> **真实字段说明（已用 ego-viewer-*.log 实测）**：EGOViewer 应用日志的 trace 标识是 **`sessionId=<uuid>`**（如 `06bf69fa-32e0-41bb-8d5f-284a8ccddcf2`），帧序号用 `frameIndex` / `leftFirstIndex` / `rightFirstIndex`，硬件时间戳用 `deviceTimestampUs` / `*TimestampUs`，app 接收时刻 = 日志行首时间戳（UTC+8 毫秒）。解析器同时兼容规格命名的 `trace_id:"<32hex>"`、`recv_hw_frame_idx`、`app_local_receive_ts`。
-
-## 异常规则（阈值默认，可配置）
-
-| 规则 | 计算 | 阈值 |
-|---|---|---|
-| `app_receive_delay` | \|app_local_receive_ts − hw_ptp_ts\| | 50 ms |
-| `sei_copy_error` | \|sei_hw_ptp_ts − hw_ptp_ts\|（SEI 嵌入校验） | 2 ms |
-| `binocular_ptp_diff` | \|left.hw_ptp − right.hw_ptp\|（同帧号，双目同步） | 1 ms |
-| `imu_video_sync` | \|最近 IMU − hw_ptp\|（数采同步） | 2 ms |
+阈值可在「阈值自适应」（依据帧率与 IMU 频率自动取阈）与「阈值固定输入」之间切换。结果只生成一份自包含 HTML 报告；用户停止时仍生成部分报告（已完成段保留结果，未完成段标 ERROR）。
 
 ## 目录结构
 
 ```
 EGOCourier/
-├── ego_relay/          核心包
-│   ├── config.py       阈值 / 字段映射 / 时区 / 文件发现
-│   ├── db.py           sqlite 存储层
-│   ├── parsers.py      四类解析器 + 时间戳归一化
-│   ├── analysis.py     对齐 + 四类异常
-│   ├── export.py       一键打包导出（zip + HTML 报告）
-│   └── cli.py          命令行工具
+├── ego_relay/          设备日志导出与配置
+│   ├── config.py       路径 / 阈值 / 设备连接配置
+│   ├── evlog_pack.py   EGOViewer 本机日志收集与打包
+│   ├── mobile_adb.py   Android 手机日志（adb）
+│   ├── orbbec_sdk.py   设备固件日志（Orbbec SDK）
+│   ├── egolowble.py / ble_provision.py  BLE 配网
+│   ├── wifi.py         WiFi 扫描 / ping
+│   ├── sftp_client.py / sftp_pull.py    SSH/SFTP 拉取
+│   ├── deps.py / deps_check.py          运行依赖检测
+│   └── __init__.py
 ├── ego_gui/            桌面 GUI（PySide6）
 │   ├── main.py         入口 + 图标（优先读 assets/，缺失时矢量兜底）
-│   └── resources.py    资源定位（兼容源码模式与 PyInstaller 打包）
+│   ├── app.py          主窗口 + 全局 QSS + 页签
+│   ├── device_tab.py   日志导出页（BLE 配网 + 三类日志一键导出 / 打包）
+│   ├── analysis_tab.py 日志分析页（内嵌 ego_checker 引擎）
+│   ├── export_tab.py   BLE 扫描后台线程
+│   └── resources.py    资源定位（源码模式与 PyInstaller 打包）
+├── ego_checker/        日志分析引擎（EGOChecker 分析内核）
+│   ├── app/            发现分段 / 分析编排 / 并行
+│   ├── analysis/       同步、丢帧、区间、音频等检查
+│   ├── data/           CSV / MCAP / 音频 / meta 读取与发现
+│   ├── media/video.py  SEI 提取、帧截取、ffmpeg
+│   ├── reporting/      HTML 报告与结果表格
+│   ├── domain/         数据模型与常量
+│   └── runtime/        路径、版本、运行日志
 ├── assets/             标志资源：make_logo.py + ego_courier.ico + logo*.png
 ├── packaging/entry.py  PyInstaller 打包入口
-├── tests/              单元测试 + GUI 冒烟测试
-├── data/               运行数据（DB、导出、临时解压）
+├── tests/              单元测试
+├── data/               运行数据（导出、分析日志、临时解压）
 ├── .venv/              首次启动自动创建的运行环境（不入库）
 ├── requirements.txt    桌面版依赖清单（启动器据此自动安装）
 ├── bootstrap.py        启动器：找 Python → 建 .venv → 装依赖 → 启动
@@ -234,19 +229,31 @@ EGOCourier/
 ├── run_desktop.py      直接启动 GUI（要求依赖已装好）
 ├── build_exe.bat       打包 .exe（onedir / onefile）
 ├── ego_courier.spec    PyInstaller 打包配置
-├── ego.bat             CLI 包装
 └── README.md
 ```
 
 ## 测试
 
 ```bat
-python -m unittest tests.test_analysis -v     :: 对齐与四类异常规则单测
-python -m pytest tests -q                     :: 全量回归（167 项）
-python tests/smoke_gui.py                     :: 桌面 GUI 冒烟（offscreen）
+python -m unittest tests.test_fixes_v107_launcher tests.test_evlog_pack tests.test_mobile_adb -v
+python -m unittest discover -s tests -p "test_*.py"
 ```
 
 ## 变更记录
+
+### v1.1.0（2026-11-19）分析引擎重构
+
+| 类别 | 变更 |
+|---|---|
+| 分析引擎 | 内嵌 **EGOChecker**（`ego_checker/`）替换旧的 EGO 对齐管线与 `video_analyzer`：一次读取目录内的 CSV / MCAP / WAV / `meta_*.json`，做帧数对齐、帧间隔、同行对齐、相机/IMU/夹爪同步、RGB/IMU 丢帧、音频完整性、元数据完整性与跨录制段边界比对，只输出一份自包含 HTML 报告（不写数据库、不生成结果 CSV / 证据目录） |
+| 日志分析页 | 重做为「目录分析 + 定时分析」双模式：后台线程 + 实时日志 + 进度、暂停/停止（停止仍出部分报告）、自适应/固定阈值、帧截取；分析完成可直接打开报告或输出目录，双击结果查看异常明细 |
+| 定时分析 | 新增每日 / 单次定时，支持多目录按序批量分析、错过补跑（默认 2 小时）、参数快照、`QLockFile` 单实例执行；配置存 `data/analysis_schedule.json` |
+| 会话记录 | 改为分析历史登记簿（`data/history/sessions.json`）：每次分析落一条记录，按结论/设备/数据目录筛选，可回看详情、重跑、删除；只存路径与统计，报告被移动时标灰而不是隐藏 |
+| 日志导出页 | 导出完成后自动把目录预填到「日志分析」页；新增「先压缩再导出 zip」；移除导出后自动导入/出报告（改由分析页统一完成） |
+| 依赖 | 移除 matplotlib；新增 `lz4`、`zstandard`（MCAP 压缩流），依赖总量约 150MB |
+| 清理 | 删除旧的会话数据库、Trace 查询、结果 CSV 导出与独立 CLI；修正帧截取分支中未定义的 `_log` 调用；移除仍调用已删除 `import_pulled` 的旧 SFTP 导出页 |
+
+测试：`python -m unittest discover -s tests -p "test_*.py"` 共 **179** 项通过（新增 `test_analysis_schedule.py` 定时调度与 `test_history_store.py` 历史登记簿用例）。
 
 ### v1.0.9（2026-11-10）缺陷修复
 
@@ -326,6 +333,7 @@ python tests/smoke_gui.py                     :: 桌面 GUI 冒烟（offscreen�
 
 ## 已知限制 / 待办
 
-- `ego device pull` 为**预留占位**：设备 WiFi/网络导出通道待确认接口（ADB / SMB / HTTP）后实现。
-- 后续迭代：异常自动截帧（对接 `frame_dumps` jpg）、AI 日志总结。
-- `app_receive_delay`（应用接收延迟）需要同一会话同时具备 **app 日志（提供接收时刻）+ 硬件 PTP（SEI，提供 hw_ptp_ts）** 才能计算；若仅有 app 日志或仅有 SEI 数据，则该规则自动跳过，不影响其余三条规则。
+- 日志分析需要目录内含可识别的采集数据（相机/IMU/夹爪 CSV、MCAP、WAV + 配套 CSV 或 meta_*.json）；纯 app/sdk 文本日志目录会被判定为无可分析分段。
+- 帧截取（不同步帧 / 同步帧图片）与 SEI 时间戳提取需要本机安装 ffmpeg/ffprobe；缺失时该两项自动跳过并提示，其余检查照常执行。
+- MCAP 压缩流分析需要 lz4 / zstandard / mcap 依赖完整；缺失时仅 MCAP 视频分析不可用。
+- 分析参数与报告中「单设备 / 多设备」的配对口径以选定值执行，不按设备组合白名单或包名时间窗口自动配对。

@@ -39,9 +39,9 @@ VENV_DIR = os.path.join(HERE, ".venv")
 VENV_PY = os.path.join(VENV_DIR, "Scripts", "python.exe")
 LOG_DIR = os.path.join(HERE, "log")
 RUN_LOG = os.path.join(LOG_DIR, "launcher.log")
-PIP_TIMEOUT_S = 60 * 45          # 全新安装 PySide6+matplotlib 约 200MB，慢网要留足
+PIP_TIMEOUT_S = 60 * 45          # 全新安装 PySide6 等依赖约 150MB，慢网要留足
 PIP_MIRROR = os.environ.get("EGO_PIP_INDEX_URL", "").strip()  # 内网镜像可选
-APP_VERSION = "1.0.9"
+APP_VERSION = "1.1.0"
 
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
@@ -207,7 +207,7 @@ def remove_broken_venv() -> str:
 
 def create_venv(py: list[str]) -> tuple[bool, str]:
     hr("首次运行：正在创建独立运行环境 .venv（只需一次，约 10–60 秒）")
-    print("PySide6 / matplotlib 等依赖约 200MB，装进 .venv 不会影响系统里其它 Python 项目。\n")
+    print("PySide6 / numpy 等依赖约 150MB，装进 .venv 不会影响系统里其它 Python 项目。\n")
     try:
         r = subprocess.run(py + ["-m", "venv", VENV_DIR],
                            capture_output=True, text=True, timeout=300,
@@ -312,7 +312,7 @@ def pin(pkg: str) -> str:
     """把裸包名换成 ``requirements.txt`` 里带版本约束的那一行。
 
     不这么做的话，``pip install PySide6`` 会拉最新版：实测新电脑装到
-    PySide6 6.12 / matplotlib 3.11 / numpy 2.5，全部越出验证范围。
+    PySide6 6.12 / numpy 2.5，全部越出验证范围。
     """
     key = pkg.strip().lower().replace("_", "-")
     return _req_specs().get(key, pkg)
@@ -381,8 +381,8 @@ def explain_pip_failure(output: str) -> str:
     """把 pip 的中英文报错收敛成一句可行动的建议。"""
     low = output.lower()
     if "no matching distribution" in low or "could not find a version" in low:
-        if "pyside6" in low or "matplotlib" in low:
-            return ("PySide6 / matplotlib 没有适用于当前 Python 版本的预编译包。\n"
+        if "pyside6" in low:
+            return ("PySide6 没有适用于当前 Python 版本的预编译包。\n"
                     "最常见原因是 Python 版本过新（3.13 / 3.14），请改装 Python 3.12 后重试。")
         return "pip 源里找不到所需版本：请确认网络可达 PyPI，或配置内网镜像。"
     if any(k in low for k in ("connection", "timed out", "ssl", "proxy", "unreachable",

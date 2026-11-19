@@ -24,18 +24,17 @@ import os
 import threading
 import time
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Optional
 
 from PySide6.QtCore import (Qt, QThread, Signal, QSettings, QPoint, QRect, QEvent,
                             QDateTime, QTime, QTimer, QElapsedTimer, QObject)
-from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QPushButton, QFileDialog,
     QLineEdit, QLabel, QGroupBox,
     QCheckBox, QMessageBox, QProgressBar, QPlainTextEdit,
     QComboBox, QFrame,
     QScrollArea, QListWidget, QListWidgetItem, QToolButton,
-    QDateTimeEdit, QDialog, QDialogButtonBox, QAbstractSpinBox,
+    QDialog, QDialogButtonBox, QAbstractSpinBox,
     QTimeEdit, QCalendarWidget,
     QTreeWidget, QTreeWidgetItem, QAbstractItemView, QSizePolicy,
 )
@@ -153,7 +152,7 @@ class DeviceExportWorker(QThread):
 
     def run(self):
         try:
-            from ego_relay import sftp_pull, export as export_mod, db
+            from ego_relay import sftp_pull
             run_dir = os.path.join(
                 self.local, "device_export_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
             os.makedirs(run_dir, exist_ok=True)
@@ -171,34 +170,10 @@ class DeviceExportWorker(QThread):
                 self.status.emit(f"远端日志拉取完成：{len(files)} 个文件，"
                                  f"{_human_size(got_bytes)}，耗时 "
                                  f"{_fmt_dur(time.monotonic() - t0)}")
-            sid, report_path = None, ""
-            if self.auto_import and files:
-                self.status.emit("导入 EGO Courier 并对齐分析中…")
-                single_archive = (
-                    len(files) == 1 and os.path.isfile(files[0])
-                    and files[0].lower().endswith((".tar.gz", ".tgz", ".zip"))
-                )
-                target = files[0] if single_archive else run_dir
-                imp = sftp_pull.import_pulled(target)
-                sid = (imp.get("session") or {}).get("id")
-                if sid:
-                    self.status.emit(f"导入完成：会话 #{sid}（对齐 + 四类异常检测）")
-                    if self.auto_report:
-                        self.status.emit("自动生成 HTML 报告…")
-                        s = db.get_session(sid)
-                        stats = db.session_stats(sid)
-                        html = export_mod._html_report(sid, s, stats)
-                        name = (s or {}).get("name") or f"session_{sid}"
-                        report_path = os.path.join(
-                            run_dir, f"report_{name}_{sid}.html")
-                        os.makedirs(self.local, exist_ok=True)
-                        with open(report_path, "w", encoding="utf-8") as fh:
-                            fh.write(html)
-                        self.status.emit(f"报告已生成：{report_path}")
-                else:
-                    self.status.emit("导入未产生会话，可能目录内无有效日志")
+            if not files:
+                self.status.emit("未拉取到文件，导出为空")
             self.progress.emit(100)
-            self.done.emit(sid, report_path)
+            self.done.emit(run_dir, "")
         except Exception as e:  # noqa: BLE001
             import traceback as _tb
             try:
@@ -294,35 +269,8 @@ class EvLogPackWorker(QThread):
                 should_cancel=self._want_cancel)
             self.status.emit(f"打包完成：{zip_path}"
                              f"（{_human_size(os.path.getsize(zip_path))}）")
-
-            sid, report_path = None, ""
-            has_analysis = bool(collected.get("app") or collected.get("firmware"))
-            if self.auto_import and has_analysis:
-                self.status.emit("导入 EGO Courier 并对齐分析中…")
-                from ego_relay import sftp_pull, export as export_mod, db
-                _t0 = time.monotonic()
-                imp = sftp_pull.import_pulled(work)
-                sid = (imp.get("session") or {}).get("id")
-                if sid:
-                    self.status.emit(f"导入完成：会话 #{sid}（对齐 + 四类异常检测），"
-                                     f"导入耗时 {_fmt_dur(time.monotonic() - _t0)}")
-                    if self.auto_report:
-                        self.status.emit("自动生成 HTML 报告…")
-                        s = db.get_session(sid)
-                        stats = db.session_stats(sid)
-                        html = export_mod._html_report(sid, s, stats)
-                        name = (s or {}).get("name") or f"session_{sid}"
-                        report_path = os.path.join(
-                            self.out_dir, f"report_{name}_{sid}.html")
-                        with open(report_path, "w", encoding="utf-8") as fh:
-                            fh.write(html)
-                        self.status.emit(f"报告已生成：{report_path}")
-                else:
-                    self.status.emit("导入未产生会话，可能所选日志不含可对齐的 app/固件日志")
-            elif self.auto_import and not has_analysis:
-                self.status.emit("所选日志不含可分析来源（app/固件），跳过导入")
             self.progress.emit(100)
-            self.done.emit(zip_path, sid, report_path)
+            self.done.emit(zip_path, None, "")
         except evlog_pack.OperationCancelled:
             self.status.emit("打包已取消")
             self.cancelled.emit()
@@ -783,19 +731,20 @@ def _fmt_dur(sec) -> str:
 class EgoOneClickExportWorker(QThread):
     progress = Signal(int)              # 0..100
     status = Signal(str)                # 文本行（写入底部日志框）
-    done = Signal(str, object, str, object)  # export_dir, session_id, report_path, 手机分组汇总
+    done = Signal(str, object, str, object, str)  # export_dir, session_id, report_path, 手机分组汇总, zip_path(未压缩为 "")
     cancelled = Signal()                # 用户取消（非失败）
     failed = Signal(str)
 
     def __init__(self, root, out_dir, keys, stage_kwargs=None,
                  auto_import=False, auto_report=False,
                  device_host="", sdk_port=None, mobile_serials=None, sdk_root="",
-                 firmware_serials=None):
+                 firmware_serials=None, zip_first=False):
         super().__init__()
         self.root, self.out_dir, self.keys = root, out_dir, keys
         self.stage_kwargs = dict(stage_kwargs or {})
         self.auto_import = auto_import
         self.auto_report = auto_report
+        self.zip_first = bool(zip_first)
         # 手机日志与固件日志并列参与同一次导出；None/空表示不碰手机。
         self.mobile_serials = list(mobile_serials or [])
         # 用户在「固件设备」里手动勾选的序列号；空表示走自动策略（历史优先 → 延迟）。
@@ -889,11 +838,10 @@ class EgoOneClickExportWorker(QThread):
         _diag(self.out_dir, text)
 
     def run(self):
-        from ego_relay import (orbbec_sdk, export as export_mod, db, config,
-                               sftp_pull)
-        from ego_relay import mobile_adb as mobile_adb_mod
+        from ego_relay import orbbec_sdk, config
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         export_dir = os.path.join(self.out_dir, f"EGO_export_{ts}")
+        zip_path = ""
         clock = {"t": time.monotonic()}
         try:
             if any(k not in ("firmware", "mobile") for k in self.keys):
@@ -1020,40 +968,15 @@ class EgoOneClickExportWorker(QThread):
                 f"已导出 {n} 个电脑端日志文件"
                 + ("（另含手机日志）" if has_mobile else "")
                 + f"到：{export_dir}")
-            sid, report_path = None, ""
-            has_analysis = bool(collected.get("app") or collected.get("firmware"))
-            if self.auto_import and has_analysis:
-                self.status.emit("导入 EGO Courier 并对齐分析中…")
-                self.progress.emit(PROGRESS_STAGES["import"][0])
-                clock["t"] = time.monotonic()
-                imp = sftp_pull.import_pulled(export_dir)
-                sid = (imp.get("session") or {}).get("id")
-                if sid:
-                    self.status.emit(f"导入完成：会话 #{sid}（对齐 + 四类异常检测）")
-                    self._diag(f"导入分析结束：会话 #{sid}，耗时 "
-                               f"{_fmt_dur(time.monotonic() - clock['t'])}")
-                    if self.auto_report:
-                        self.status.emit("自动生成 HTML 报告…")
-                        s = db.get_session(sid)
-                        stats = db.session_stats(sid)
-                        html = export_mod._html_report(sid, s, stats)
-                        name = (s or {}).get("name") or f"session_{sid}"
-                        report_path = os.path.join(
-                            export_dir, f"report_{name}_{sid}.html")
-                        with open(report_path, "w", encoding="utf-8") as fh:
-                            fh.write(html)
-                        self.status.emit(f"报告已生成：{report_path}")
-                else:
-                    self.status.emit("导入未产生会话，可能所选日志不含可对齐的 app/固件日志")
-            elif self.auto_import and not has_analysis:
-                self.status.emit("所选日志不含可分析来源（app/固件），跳过导入")
+            if self.zip_first:
+                zip_path = self._zip_export(export_dir)
             self.progress.emit(100)
-            self.done.emit(export_dir, sid, report_path, self.mobile_summary)
+            self.done.emit(export_dir, None, "", self.mobile_summary, zip_path)
         except evlog_pack.OperationCancelled:
             self.status.emit("一键导出已取消")
             # 取消时删掉本次目录：里面只有半拉的文件，留着会被下次的导入/人工检查
             # 当成一份"导出的结果"（打包那边同样不留残缺 zip）。
-            self._discard_partial(export_dir)
+            self._discard_partial(export_dir, zip_path)
             self.cancelled.emit()
         except Exception as e:  # noqa: BLE001
             # 失败时把阶段耗时和完整堆栈一起落盘：弹窗只有一句 str(e)，
@@ -1065,17 +988,61 @@ class EgoOneClickExportWorker(QThread):
             except Exception:  # noqa: BLE001
                 pass
             # 失败同样丢弃本次目录（诊断日志写在输出根目录，不受影响）。
-            self._discard_partial(export_dir)
+            self._discard_partial(export_dir, zip_path)
             self.failed.emit(str(e))
 
-    def _discard_partial(self, export_dir):
-        """删除本次导出留下的半成品目录（取消/失败）。
+    def _zip_export(self, export_dir) -> str:
+        """把本次导出目录压成同名 zip（与导出目录同级），返回 zip 路径。
 
-        只动自己刚建的那个 EGO_export_<时间戳>/，不碰输出根目录下别人的东西；
-        诊断日志在输出根目录，删了也不丢排查信息。删除失败（文件被占用）不抛错
-        ——它只是清理，不能覆盖真实的取消/失败原因。
+        导出目录保留：「日志分析」页仍可直接分析目录；zip 用于对外发送。
+        """
+        import zipfile
+        zip_path = export_dir.rstrip("\\/") + ".zip"
+        base = os.path.basename(export_dir.rstrip("\\/"))
+        files = []
+        for dirpath, _dirnames, filenames in os.walk(export_dir):
+            for fn in filenames:
+                files.append(os.path.join(dirpath, fn))
+        total = len(files)
+        self.status.emit(
+            f"先压缩再导出：把 {total} 个文件打包为 {os.path.basename(zip_path)}…")
+        written = 0
+        try:
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                for full in files:
+                    if self._want_cancel():
+                        raise evlog_pack.OperationCancelled("操作已取消")
+                    rel = os.path.relpath(full, export_dir).replace("\\", "/")
+                    zf.write(full, f"{base}/{rel}")
+                    written += 1
+                    if total:
+                        self.progress.emit(
+                            _stage_map("pack", written * 100 / total))
+        except BaseException:
+            # 取消或异常：不留下写了一半的 zip
+            try:
+                if os.path.exists(zip_path):
+                    os.remove(zip_path)
+            except OSError:
+                pass
+            raise
+        self.status.emit(
+            f"压缩完成：{zip_path}（{_human_size(os.path.getsize(zip_path))}）")
+        return zip_path
+
+    def _discard_partial(self, export_dir, zip_path=""):
+        """删除本次导出留下的半成品目录与 zip（取消/失败）。
+
+        只动自己刚建的那个 EGO_export_<时间戳>/ 和同名 .zip，不碰输出根目录下
+        别人的东西；诊断日志在输出根目录，删了也不丢排查信息。删除失败（文件被
+        占用）不抛错——它只是清理，不能覆盖真实的取消/失败原因。
         """
         import shutil as _sh
+        if zip_path and os.path.isfile(zip_path):
+            try:
+                os.remove(zip_path)
+            except OSError:
+                pass
         if not export_dir or not os.path.isdir(export_dir):
             return
         try:
@@ -1273,7 +1240,7 @@ class DateTimePopup(QWidget):
 
     committed = Signal()   # 点「确定」确认选择
 
-    def __init__(self, target: "DateTimeField", parent=None):
+    def __init__(self, target: "ClickableDateTimeEdit", parent=None):
         super().__init__(parent, Qt.Popup)
         self._target = target
         self.setObjectName("dtPopup")
@@ -1538,7 +1505,7 @@ class FirmwareDevicePicker(QDialog):
 
 
 class DeviceTab(QWidget):
-    imported = Signal(int)   # 拉取并导入成功后发出 session_id（供会话记录页刷新）
+    analyze_requested = Signal(str)   # 导出完成后请求把目录送进「日志分析」页
     # 未勾选「EGOViewer 手机日志」时下拉框里的提示语
     _MOBILE_IDLE_TEXT = "勾选左侧「EGOViewer 手机日志」后自动扫描手机"
 
@@ -1859,15 +1826,14 @@ class DeviceTab(QWidget):
         r += 1
 
         # --- 选项（设备实时拉取与本地打包共用） ---
-        self.chk_zip = QCheckBox("先压缩再导出")
+        # 分析已迁到「日志分析」页，这里只保留纯导出/打包选项。
+        self.chk_zip = QCheckBox("先压缩再导出zip")
         self.chk_zip.setChecked(True)
-        self.chk_import = QCheckBox("拉取后自动导入分析")
-        self.chk_import.setChecked(True)
-        self.chk_report = QCheckBox("自动生成 HTML 报告")
-        self.chk_report.setChecked(True)
+        self.chk_zip.setToolTip(
+            "勾选后「开始一键导出」会在导出目录旁额外生成同名 .zip；"
+            "导出目录保留，仍可在「日志分析」页直接分析")
         pk_chk = QHBoxLayout()
-        for w in (self.chk_zip, self.chk_import, self.chk_report):
-            pk_chk.addWidget(w)
+        pk_chk.addWidget(self.chk_zip)
         pk_chk.addStretch(1)
         pk_chk_w = QWidget(); pk_chk_w.setLayout(pk_chk)
         v.addWidget(self._field_label("选项"), r, 0)
@@ -2375,13 +2341,12 @@ class DeviceTab(QWidget):
         self._export_worker = EgoOneClickExportWorker(
             root or "", out_dir, keys,
             stage_kwargs=filters,
-            auto_import=self.chk_import.isChecked(),
-            auto_report=self.chk_report.isChecked(),
             device_host=self._device_ip,
             sdk_port=relay_config.ORBBEC_SDK_PORT,
             sdk_root=self._current_sdk_root(),
             mobile_serials=mobile_serials,
-            firmware_serials=self._fw_serials)
+            firmware_serials=self._fw_serials,
+            zip_first=self.chk_zip.isChecked())
         self._export_worker.progress.connect(self._progress_ui.set_value)
         self._export_worker.status.connect(self._append)
         self._export_worker.done.connect(self._on_export_done)
@@ -2430,15 +2395,15 @@ class DeviceTab(QWidget):
             f"Ping {host} 不通。\n\n设备固件日志需要能经网络访问该 IP。\n"
             "是否仍然继续尝试导出？") == QMessageBox.Yes
 
-    def _on_export_done(self, export_dir, sid, report_path, mobile_summary=None):
-        if sid:
-            self._append(f"完成：会话 #{sid} 已入库")
-            self.log(f"一键导出并导入成功: 会话 #{sid}")
-            self.imported.emit(sid)
-        else:
-            self._append("导出完成，但未产生可分析会话")
-        if report_path:
-            self._append(f"报告已生成：{report_path}")
+    def _on_export_done(self, export_dir, sid, report_path, mobile_summary=None,
+                        zip_path=""):
+        self._append("导出完成")
+        self.log(f"一键导出完成：{export_dir}")
+        if zip_path:
+            self.log(f"日志压缩包：{zip_path}")
+        if getattr(self, "_after_export_analyze", False):
+            self._after_export_analyze = False
+            self._analyze_exported(export_dir)
         # 手机日志的分组只能从目录结构看出，导出后在日志里列一遍，免得用户再去找
         mob_lines = []
         for ph in (mobile_summary or {}).get("phones", []):
@@ -2449,15 +2414,29 @@ class DeviceTab(QWidget):
             self._append("手机日志设备分组：")
             for line in mob_lines:
                 self._append(line)
+        if zip_path:
+            text = (f"已导出日志到：\n{export_dir}\n\n"
+                    f"已生成压缩包：\n{zip_path}\n"
+                    "\n是否打开所在文件夹？")
+            target = zip_path
+        else:
+            text = (f"已导出日志到：\n{export_dir}\n"
+                    "\n可在「日志分析」页对该目录做完整性分析。"
+                    "\n\n是否打开所在文件夹？")
+            target = export_dir
         ret = QMessageBox.question(
-            self, "导出完成",
-            f"已导出日志到：\n{export_dir}\n"
-            + (f"\n分析会话：#{sid}\n报告：{report_path}" if report_path else "")
-            + "\n\n是否打开所在文件夹？",
+            self, "导出完成", text,
             QMessageBox.Yes | QMessageBox.No)
         if ret == QMessageBox.Yes:
             import subprocess
-            subprocess.Popen(["explorer", "/select,", export_dir])
+            subprocess.Popen(["explorer", "/select,", target])
+
+    def _analyze_exported(self, path):
+        """把刚导出的目录交给「日志分析」页（不自动开始，避免误触发耗时分析）。"""
+        try:
+            self.analyze_requested.emit(path)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _on_export_fail(self, err):
         self._append(f"[错误] 一键导出失败: {err}")
@@ -2656,7 +2635,6 @@ class DeviceTab(QWidget):
                 counts = {k: len(v) for k, v in c.items()}
             except Exception:  # noqa: BLE001
                 counts = {}
-        manual_mode = self.cmb_filter.currentData() == "manual"
         for key, lbl in self._pack_counts.items():
             if key == "firmware":
                 txt = self._firmware_count_text(filters)
@@ -2822,8 +2800,6 @@ class DeviceTab(QWidget):
         self._pack_worker = EvLogPackWorker(
             root, out_dir, keys,
             stage_kwargs=filters,
-            auto_import=self.chk_import.isChecked(),
-            auto_report=self.chk_report.isChecked(),
             device_host=self._device_ip,
             sdk_port=relay_config.ORBBEC_SDK_PORT,
             sdk_root=self._current_sdk_root(),
@@ -2839,16 +2815,10 @@ class DeviceTab(QWidget):
     def _on_pack_done(self, zip_path, sid, report_path):
         self._append(f"打包完成：{zip_path}")
         self.log(f"本地 EGOViewer 日志打包完成: {zip_path}")
-        if sid:
-            self._append(f"分析完成：会话 #{sid} 已入库")
-            self.log(f"本地日志分析入库成功: 会话 #{sid}")
-            self.imported.emit(sid)
-        if report_path:
-            self._append(f"报告已生成：{report_path}")
         ret = QMessageBox.question(
             self, "打包完成", f"已生成日志包：\n{zip_path}\n"
-            + (f"\n分析会话：#{sid}\n报告：{report_path}" if report_path else "")
-            + "\n\n是否打开所在文件夹？",
+            "\n可在「日志分析」页对该包导出后的目录做完整性分析。"
+            "\n\n是否打开所在文件夹？",
             QMessageBox.Yes | QMessageBox.No)
         if ret == QMessageBox.Yes:
             import subprocess

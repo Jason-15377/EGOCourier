@@ -32,7 +32,6 @@ def _default_data_root() -> Path:
 DATA_ROOT = _default_data_root()
 DATA_ROOT.mkdir(parents=True, exist_ok=True)
 
-DB_PATH = DATA_ROOT / "ego_relay.db"
 EXPORT_DIR = DATA_ROOT / "exports"
 IMPORT_TMP = DATA_ROOT / "tmp_import"
 THRESH_FILE = DATA_ROOT / "thresholds.json"

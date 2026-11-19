@@ -2,7 +2,7 @@
 """EGO Courier 便携版打包配置（launcher + runtime）。
 
 与 ``ego_courier.spec`` 的区别：把 PyInstaller 的内容目录从 ``_internal/`` 改名成
-``runtime/``，并让第三方库（PySide6 / matplotlib / numpy / paramiko …）全部摊在
+``runtime/``，并让第三方库（PySide6 / numpy / paramiko …）全部摊在
 ``runtime/`` 里，exe 只保留引导器与启动脚本。产出结构对齐团队里既有的
 ``Ego-Vue Simple Evaluate``：
 
@@ -40,18 +40,17 @@ datas = []
 # 图标 / 标志（运行时 resources.py 通过 sys._MEIPASS/assets 读取）
 datas += [(os.path.join(HERE, "assets"), "assets")]
 
-# matplotlib 的 mpl-data（字体、样式表）；不收集会导致图形缺字/报错
-try:
-    datas += collect_data_files("matplotlib")
-except Exception:
-    pass
+# 日志分析引擎（内嵌 ego_checker）的分析图标资源随包携带
+_checker_res = os.path.join(HERE, "ego_checker", "resources")
+if os.path.isdir(_checker_res):
+    datas += [(_checker_res, os.path.join("ego_checker", "resources"))]
 
 # 应用源码明文入包：供启动器优先从 runtime/app 导入（便于现场热改）
 if BUNDLE_SOURCE:
     _ignores = shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo")
     _stage = os.path.join(HERE, "build", "_portable_app")
     shutil.rmtree(_stage, ignore_errors=True)
-    for pkg in ("ego_relay", "ego_gui"):
+    for pkg in ("ego_relay", "ego_gui", "ego_checker"):
         src = os.path.join(HERE, pkg)
         if os.path.isdir(src):
             # 先拷到暂存目录并剔除 __pycache__：带旧 .pyc 进包会让现场改 .py 后
@@ -76,10 +75,12 @@ hiddenimports = []
 # 这些包按子模块动态使用，PyInstaller 静态分析容易漏
 hiddenimports += collect_submodules("ego_relay")
 hiddenimports += collect_submodules("ego_gui")
+hiddenimports += collect_submodules("ego_checker")
 hiddenimports += [
     "PySide6.QtSvg",
-    "matplotlib.backends.backend_qtagg",
     "mcap",
+    "lz4",
+    "zstandard",
     "mcap_ros2_support",
 ]
 

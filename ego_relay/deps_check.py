@@ -18,31 +18,32 @@ import sys
 PACKAGES: list[tuple[str, str, str, bool, str]] = [
     ("PySide6", "PySide6", "PySide6", True,
      "图形界面无法启动"),
-    ("matplotlib", "matplotlib", "matplotlib", True,
-     "分析页签的曲线图无法显示"),
     ("numpy", "numpy", "numpy", True,
-     "视频/SEI 分析无法运行"),
+     "日志分析的数值检查无法运行"),
     ("paramiko", "paramiko", "paramiko", True,
      "设备日志导出模块导入失败（界面直接打不开）"),
+    ("lz4", "lz4", "lz4", False,
+     "仅 MCAP 视频流分析不可用"),
+    ("zstandard", "zstandard", "zstandard", False,
+     "仅 MCAP 压缩流分析不可用"),
     ("mcap", "mcap", "mcap", False,
      "仅 MCAP 视频分析不可用"),
     ("mcap-ros2-support", "mcap_ros2", "mcap-ros2-support", False,
      "仅 MCAP ROS2 视频分析不可用"),
 ]
 
-# Python 版本策略：3.10–3.12 有完整轮子；3.13 起 PySide6/matplotlib 轮子不全。
+# Python 版本策略：3.10–3.12 有完整轮子；3.13 起 PySide6 轮子覆盖不全。
 MIN_VERSION = (3, 10)
 RECOMMENDED_VERSION = (3, 12)
 MAX_TESTED_VERSION = (3, 12)
 
 # 主要包的版本上限（不含边界，与 requirements.txt 的 ``<X`` 一致）。
 # 只装「包名」而不带约束时，新电脑的 pip 会拉到最新版（实测 PySide6 6.12 /
-# matplotlib 3.11 / numpy 2.5），超出本程序验证过的范围后 GUI 会起不来；
+# numpy 2.5），超出本程序验证过的范围后 GUI 会起不来；
 # 而旧的缺失检测只看「能否 import」，会把越界版本判成齐全并永远跳过安装。
 # 维护提醒：改 requirements.txt 的版本约束时，这里必须同步改。
 VERSION_CAPS: dict[str, str] = {
     "PySide6": "6.9",
-    "matplotlib": "3.11",
     "numpy": "2.3",
 }
 
@@ -71,7 +72,7 @@ def python_problem(version: tuple[int, int, int] | None = None) -> str:
         return (f"{where} 版本过低，本程序需要 Python {MIN_VERSION[0]}.{MIN_VERSION[1]} 及以上。")
     if v[:2] > MAX_TESTED_VERSION:
         return (
-            f"{where} 版本过新：Python {v[0]}.{v[1]} 上 PySide6 / matplotlib 的预编译包"
+            f"{where} 版本过新：Python {v[0]}.{v[1]} 上 PySide6 的预编译包"
             f"覆盖不全，安装依赖会失败。\n"
             f"    请安装 Python {RECOMMENDED_VERSION[0]}.{RECOMMENDED_VERSION[1]}"
             f"（https://www.python.org/downloads/release/python-31210/ ，"

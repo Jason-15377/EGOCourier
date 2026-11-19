@@ -57,38 +57,5 @@ class TestBleProvisionErrors(unittest.TestCase):
             ble_provision.provision("AA:BB", "", "")
 
 
-class TestSftpPullImport(unittest.TestCase):
-    def _make_targz(self):
-        tmp = tempfile.mkdtemp()
-        root = os.path.join(tmp, "logs")
-        os.makedirs(root)
-        # 一个最小可解析的硬件 PTP CSV（frame_index,timestamp_us）
-        with open(os.path.join(root, "L_sei.csv"), "w", encoding="utf-8") as f:
-            f.write("frame_index,timestamp_us\n0,1000000\n1,2000000\n")
-        arc = os.path.join(tmp, "logs.tar.gz")
-        with tarfile.open(arc, "w:gz") as tf:
-            tf.add(root, arcname="logs")
-        return tmp, arc, root
-
-    def test_import_targz(self):
-        from ego_relay import sftp_pull
-        tmp, arc, root = self._make_targz()
-        try:
-            r = sftp_pull.import_pulled(arc)
-            self.assertTrue(r["session"]["id"])
-            self.assertGreaterEqual(r["stats"].get("frames", 0), 0)
-        finally:
-            pass  # 临时目录保留便于排查
-
-    def test_import_dir(self):
-        from ego_relay import sftp_pull
-        tmp, arc, root = self._make_targz()
-        try:
-            r = sftp_pull.import_pulled(root)
-            self.assertTrue(r["session"]["id"])
-        finally:
-            pass
-
-
 if __name__ == "__main__":
     unittest.main(verbosity=2)

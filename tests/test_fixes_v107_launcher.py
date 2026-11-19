@@ -32,8 +32,8 @@ class TestVersionCaps(unittest.TestCase):
         """VERSION_CAPS 与 requirements.txt 是两份数据，必须一致。"""
         caps = d.VERSION_CAPS
         self.assertEqual(caps["PySide6"], "6.9")
-        self.assertEqual(caps["matplotlib"], "3.11")
         self.assertEqual(caps["numpy"], "2.3")
+        self.assertNotIn("matplotlib", caps, "分析图表已移除，不再需要 matplotlib 上限")
 
     def test_ver_tuple(self):
         self.assertEqual(d._ver_tuple("6.8.3"), (6, 8, 3))
@@ -52,15 +52,15 @@ class TestVersionCaps(unittest.TestCase):
         self.assertFalse(d._too_new("numpy", None))
 
     def test_dev_machine_versions_are_in_range(self):
-        """开发机的 6.8.3 / 3.10.9 / 2.2.6 必须不被判为越界（否则会白降级）。"""
-        for pip_name, ver in (("PySide6", "6.8.3"), ("matplotlib", "3.10.9"),
-                              ("numpy", "2.2.6")):
+        """开发机的 6.8.3 / 2.2.6 必须不被判为越界（否则会白降级）。"""
+        for pip_name, ver in (("PySide6", "6.8.3"), ("numpy", "2.2.6")):
             self.assertFalse(d._too_new(pip_name, ver), f"{pip_name} {ver} 不该越界")
 
     def test_too_new_counts_as_missing(self):
         """装了越界版本也要算缺失，否则永远跳过安装。"""
-        fake = {"PySide6": "6.12.0", "matplotlib": "3.10.9", "numpy": "2.5.4",
-                "paramiko": "5.1.0", "mcap": "1.5.0", "mcap-ros2-support": "0.5.7"}
+        fake = {"PySide6": "6.12.0", "numpy": "2.5.4",
+                "paramiko": "5.1.0", "mcap": "1.5.0", "mcap-ros2-support": "0.5.7",
+                "lz4": "4.3.3", "zstandard": "0.23.0"}
         with mock.patch.object(d, "installed_version", side_effect=fake.get), \
                 mock.patch.object(d, "_importable", return_value=True):
             names = [m[0] for m in d.missing()]
@@ -77,7 +77,6 @@ class TestVersionCaps(unittest.TestCase):
 class TestPin(unittest.TestCase):
     def test_pin_uses_requirements_constraints(self):
         self.assertEqual(b.pin("PySide6"), "PySide6>=6.6,<6.9")
-        self.assertEqual(b.pin("matplotlib"), "matplotlib>=3.7,<3.11")
         self.assertEqual(b.pin("numpy"), "numpy>=1.24,<2.3")
         self.assertEqual(b.pin("mcap-ros2-support"), "mcap-ros2-support>=0.5")
 

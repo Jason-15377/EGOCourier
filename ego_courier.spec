@@ -39,11 +39,10 @@ datas = []
 # 图标 / 标志（运行时 resources.py 通过 sys._MEIPASS/assets 读取）
 datas += [(os.path.join(HERE, "assets"), "assets")]
 
-# matplotlib 的 mpl-data（字体、样式表）；不收集会导致图形缺字/报错
-try:
-    datas += collect_data_files("matplotlib")
-except Exception:
-    pass
+# 日志分析引擎（内嵌 ego_checker）的分析图标资源随包携带
+_checker_res = os.path.join(HERE, "ego_checker", "resources")
+if os.path.isdir(_checker_res):
+    datas += [(_checker_res, os.path.join("ego_checker", "resources"))]
 
 # ---------------------------------------------------------------- 二进制
 
@@ -61,10 +60,12 @@ hiddenimports = []
 # 这些包按子模块动态使用，PyInstaller 静态分析容易漏
 hiddenimports += collect_submodules("ego_relay")
 hiddenimports += collect_submodules("ego_gui")
+hiddenimports += collect_submodules("ego_checker")
 hiddenimports += [
     "PySide6.QtSvg",
-    "matplotlib.backends.backend_qtagg",
     "mcap",
+    "lz4",
+    "zstandard",
     "mcap_ros2_support",
 ]
 

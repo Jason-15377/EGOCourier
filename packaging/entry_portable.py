@@ -46,7 +46,7 @@ def _install_excepthook() -> None:
 
 
 def _roots() -> list[str]:
-    """按优先级返回可导入 ego_relay / ego_gui 的目录。"""
+    """按优先级返回可导入 ego_relay / ego_gui / ego_checker 的目录。"""
     out: list[str] = []
 
     if getattr(sys, "frozen", False):
@@ -95,15 +95,14 @@ def _preflight() -> str:
 
     try:
         from ego_relay import config  # noqa: F401
-        from ego_relay import db
     except Exception as exc:
         return f"核心模块 ego_relay 导入失败（{exc}）。请确认 runtime/app 目录存在。"
 
     try:
-        db.init_db()
+        config.DATA_ROOT.mkdir(parents=True, exist_ok=True)
     except Exception as exc:
         return (
-            f"无法初始化数据库（{exc}）。\n"
+            f"无法创建数据目录（{exc}）。\n"
             f"数据目录：{getattr(config, 'DATA_ROOT', '?')}\n"
             "该目录可能被占用或没有写入权限。"
         )

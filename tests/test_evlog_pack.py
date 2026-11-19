@@ -312,5 +312,33 @@ def test_ui_has_no_firmware_mode_selector():
     tab.deleteLater()
 
 
+class TestOneClickExportZip(unittest.TestCase):
+    """「先压缩再导出zip」必须真的产出 zip，而不是只留一个导出目录。"""
+
+    def test_zip_export_creates_zip_and_cleanup(self):
+        import zipfile
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+        from ego_gui.device_tab import EgoOneClickExportWorker
+
+        _app = QApplication.instance() or QApplication([])
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out")
+            export_dir = os.path.join(out, "EGO_export_20261118_120000")
+            os.makedirs(os.path.join(export_dir, "app"))
+            with open(os.path.join(export_dir, "app", "ego.log"),
+                      "w", encoding="utf-8") as fh:
+                fh.write("log")
+            worker = EgoOneClickExportWorker("", out, ["app"], zip_first=True)
+            zip_path = worker._zip_export(export_dir)
+            self.assertTrue(os.path.isfile(zip_path))
+            with zipfile.ZipFile(zip_path) as zf:
+                self.assertIn("EGO_export_20261118_120000/app/ego.log",
+                              zf.namelist())
+            worker._discard_partial(export_dir, zip_path)
+            self.assertFalse(os.path.exists(export_dir))
+            self.assertFalse(os.path.exists(zip_path))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
