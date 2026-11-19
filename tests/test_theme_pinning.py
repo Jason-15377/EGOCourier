@@ -97,6 +97,25 @@ class TestStylesheetCoversNativeWidgets(unittest.TestCase):
         self.assertIn("QMenu", self.style)
         self.assertIn("QToolTip", self.style)
 
+    def test_item_view_indicators_use_app_checkbox_style(self):
+        """列表/树里的勾选项也必须由 QSS 绘制，不能落回系统原生蓝色实心块。
+
+        现场反馈：勾选手机日志后打开「固件设备」选择框，里面的选项是
+        Windows 强调色填充 + 白勾，与界面其它勾选框不是一套样式。
+        """
+        self.assertIn("QListView::indicator, QTreeView::indicator", self.style)
+        checked_rule = self.style.split(
+            "QListView::indicator:checked, QTreeView::indicator:checked {", 1)[1]
+        checked_rule = checked_rule.split("}", 1)[0]
+        self.assertIn('image:url("', checked_rule)
+        self.assertIn("/assets/check.svg", checked_rule.replace("\\", "/"))
+
+    def test_firmware_device_picker_uses_light_selection(self):
+        """选择设备列表的行选中态用浅蓝，而不是系统深蓝高亮。"""
+        self.assertIn("QListWidget#fwDeviceList::item:selected {",
+                      self.style)
+        self.assertIn("background:#dbeafe", self.style)
+
     def test_scrollbars_are_styled(self):
         self.assertIn("QScrollBar::handle:vertical", self.style)
 
@@ -234,5 +253,94 @@ class TestCheckboxRendering(unittest.TestCase):
             main_mod._pin_light_appearance(self.app)
 
 
+class TestItemViewIndicatorRendering(unittest.TestCase):
+    """按像素验收「固件设备」列表里的勾选项：白底灰边 + 深色 ✓，无蓝色实心块。"""
+
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+
+        cls.app = QApplication.instance() or QApplication([])
+        main_mod._pin_light_appearance(cls.app)
+
+    def _render(self, checked):
+        """渲染一条 fwDeviceList 选项，返回勾选框附近的 {(x, y): 颜色名}。"""
+        from PySide6.QtCore import Qt
+        from PySide6.QtGui import QColor, QImage
+        from PySide6.QtWidgets import (QListWidget, QListWidgetItem, QMainWindow,
+                                       QVBoxLayout, QWidget)
+
+        win = QMainWindow()
+        win.setStyleSheet(app_mod.STYLE)
+        central = QWidget()
+        win.setCentralWidget(central)
+        lay = QVBoxLayout(central)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lw = QListWidget()
+        lw.setObjectName("fwDeviceList")
+        lw.setSelectionMode(QListWidget.NoSelection)
+        it = QListWidgetItem("EGO-4B · SN123 | USB3")
+        it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
+        it.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+        lw.addItem(it)
+        lay.addWidget(lw)
+        win.resize(360, 90)
+        win.show()
+        self.app.processEvents()
+        self.app.processEvents()
+        img = win.grab().toImage().convertToFormat(QImage.Format_RGB32)
+        rect = lw.visualItemRect(lw.item(0))
+        origin = lw.mapTo(win, rect.topLeft())
+        # 只看勾选框附近，不把行选中/文字算进来
+        box = {}
+        for y in range(origin.y(), origin.y() + rect.height()):
+            for x in range(origin.x(), origin.x() + 40):
+                box[(x, y)] = QColor(img.pixel(x, y)).name()
+        win.close()
+        return box
+
+    @staticmethod
+    def _bounds(px):
+        border = "#a1a8b3"
+        pts = [p for p, c in px.items() if c == border]
+        if not pts:
+            raise AssertionError("找不到勾选框灰边框")
+        return (min(x for x, _ in pts), min(y for _, y in pts),
+                max(x for x, _ in pts), max(y for _, y in pts))
+
+    @staticmethod
+    def _is_dark(color):
+        return max(int(color[1:3], 16), int(color[3:5], 16),
+                   int(color[5:7], 16)) < 120
+
+    def test_checked_indicator_draws_check_without_blue_fill(self):
+        px = self._render(True)
+        left, top, right, bottom = self._bounds(px)
+        self.assertGreater(right - left, 8, "勾选框宽度异常")
+        self.assertGreater(bottom - top, 8, "勾选框高度异常")
+
+        colors = [px[(x, y)] for y in range(top + 2, bottom - 1)
+                  for x in range(left + 2, right - 1)]
+        blue = 0
+        for c in colors:
+            r = int(c[1:3], 16)
+            g = int(c[3:5], 16)
+            b = int(c[5:7], 16)
+            if b > r + 30 and b > g + 20:
+                blue += 1
+        self.assertEqual(blue, 0, f"勾选框里出现蓝色填充（{blue} 像素）")
+        dark = sum(1 for c in colors if self._is_dark(c))
+        self.assertGreaterEqual(dark, 6, "勾选后看不到 ✓")
+
+    def test_unchecked_indicator_is_white_inside(self):
+        px = self._render(False)
+        left, top, right, bottom = self._bounds(px)
+        dark = sum(1 for y in range(top + 2, bottom - 1)
+                   for x in range(left + 2, right - 1)
+                   if self._is_dark(px[(x, y)]))
+        self.assertEqual(dark, 0, f"未勾选时框内不该有深色笔画（{dark}）")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+

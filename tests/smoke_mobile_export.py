@@ -28,6 +28,10 @@ print("groups:", groups)
 assert not any("③" in t for t in groups), "③ 分组应已删除"
 assert any("②" in t for t in groups), "② 分组应保留"
 
+# 勾选手机日志会自动拉起「固件设备」选择框；本冒烟不涉及设备选择，
+# 桩掉避免模态框挂住（真实现见 tests/test_mobile_fw_picker.py）。
+tab._pick_firmware_devices = lambda *a, **k: None
+
 # 1) 勾选手机日志 → 自动扫描
 tab.chk_mobile.setChecked(True)
 loop = QEventLoop()

@@ -84,6 +84,13 @@ QListWidget#devicePopupList { background:#ffffff; border:1px solid #e2e5ea;
 QListWidget#devicePopupList::item { padding:6px 8px; border-radius:4px; }
 QListWidget#devicePopupList::item:selected { background:#dbeafe; color:#1e3a8a; }
 QListWidget#devicePopupList::item:hover:!selected { background:#eff6ff; }
+/* ---- 固件设备勾选列表：与表单其它列表同一套浅色选中态 ----
+   不写规则时行选中会套用系统深蓝高亮，勾选框也是系统实心蓝。 */
+QListWidget#fwDeviceList { background:#ffffff; border:1px solid #e2e5ea;
+  border-radius:6px; outline:0; }
+QListWidget#fwDeviceList::item { padding:6px 8px; border-radius:4px; }
+QListWidget#fwDeviceList::item:selected { background:#dbeafe; color:#1e3a8a; }
+QListWidget#fwDeviceList::item:hover:!selected { background:#eff6ff; }
 /* ---- 分组框 / 卡片 ---- */
 QGroupBox { border:1px solid #e2e5ea; border-radius:8px; margin-top:14px; font-weight:600; background:#ffffff; }
 QGroupBox::title { subcontrol-origin:margin; left:10px; padding:0 4px; color:#374151; }
@@ -120,6 +127,18 @@ QCheckBox::indicator:hover, QRadioButton::indicator:hover {
 QCheckBox::indicator:checked { image:url("__CHECK_SVG__"); }
 QRadioButton::indicator:checked { background:#ffffff; border:3px solid #2563eb; }
 QCheckBox::indicator:disabled, QRadioButton::indicator:disabled {
+  background:#f3f4f6; border-color:#d1d5db; }
+/* ---- 列表 / 树里的勾选项 ----
+   QListWidgetItem / QTreeWidgetItem 的 indicator 不由 QCheckBox 规则接管，
+   默认仍按系统原生样式绘制：Windows 11 上勾选态是强调色实心块 + 白勾。
+   现场反馈「选择设备」弹窗里的选项是深蓝色填充带勾，与界面其它勾选框不一致，
+   这里把同一套白底 + 灰边 + check.svg 用到 item view 上。 */
+QListView::indicator, QTreeView::indicator { width:14px; height:14px;
+  background:#ffffff; border:1px solid #a1a8b3; border-radius:3px; }
+QListView::indicator:hover, QTreeView::indicator:hover { border-color:#2563eb; }
+QListView::indicator:checked, QTreeView::indicator:checked {
+  image:url("__CHECK_SVG__"); }
+QListView::indicator:disabled, QTreeView::indicator:disabled {
   background:#f3f4f6; border-color:#d1d5db; }
 /* ---- 下拉列表弹层 / 右键菜单 / 提示条 ----
    弹层是独立顶层窗口，不继承主窗口的浅色面版，深色系统下会整块变黑

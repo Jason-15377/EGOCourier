@@ -27,6 +27,59 @@ def generate_result_csv(results: List[PartResult], out_path: Path,
     return out_path
 
 
+_PROBLEM_LABELS = {"FAIL": "异常", "ERROR": "执行异常", "UNVERIFIED": "未验证"}
+
+
+def problem_parts(results: List[PartResult]) -> List[Dict]:
+    """列出未通过的 Part 及原因（与明细表列口径一致）。
+
+    仅用于完成提示与报告快速定位，不改变统计口径；whitelisted 的 Part
+    （用户已确认豁免）不列入。每项包含：
+      index   在 results 中的下标（HTML 行锚点 part-{index+1} 使用同一顺序）
+      name    Part 名
+      status  FAIL / ERROR / UNVERIFIED
+      label   中文状态
+      reasons [(列名, 单元格文本), ...] 失败的检查列
+    """
+    if not results:
+        return []
+    cols = ReportColumns(results)
+    headers = cols.headers()
+    problems: List[Dict] = []
+    for index, r in enumerate(results):
+        if getattr(r, "whitelisted", False):
+            continue
+        status = str(getattr(r, "business_status", "") or "")
+        if status == "PASS":
+            continue
+        cells = cols.row_cells(r)
+        reasons = []
+        # 最后一列是业务结论，原因只取各检查列（与 headers 对齐）。
+        for header, cell in zip(headers[:-1], cells[:-1]):
+            text = str(cell or "")
+            if text.startswith(("FAIL", "ERROR")):
+                reasons.append((str(header), text))
+        if not reasons:
+            error_text = str(getattr(r, "error", "") or "").strip()
+            failed = [str(key) for key, ok in (getattr(r, "checks", {}) or {}).items()
+                      if not ok]
+            if error_text:
+                reasons.append(("执行异常", error_text))
+            elif failed:
+                reasons.append(("未通过检查",
+                                "、".join(failed[:5]) + (" 等" if len(failed) > 5 else "")))
+            elif status == "UNVERIFIED":
+                reasons.append(("未验证", "没有可执行的检查项"))
+        problems.append({
+            "index": index,
+            "name": str(getattr(r, "name", "") or f"Part {index + 1}"),
+            "status": status or "FAIL",
+            "label": _PROBLEM_LABELS.get(status, status or "异常"),
+            "reasons": reasons,
+        })
+    return problems
+
+
 def compute_stats(results: List[PartResult]) -> Dict:
     total = len(results)
     valid = [r for r in results if not r.error]
@@ -80,7 +133,7 @@ h2{{font-size:15px;margin:24px 0 12px;font-weight:600;color:#1d2129;}}
 .stat{{background:#fff;border:1px solid var(--bd);border-radius:8px;padding:14px;text-align:center;}}
 .stat .n{{font-size:24px;font-weight:700;color:#1d2129;}}
 .stat .l{{color:var(--muted);font-size:12px;font-weight:500;letter-spacing:0.2px;margin-top:4px;}}
-.tablewrap{{max-height:70vh;overflow:auto;border:1px solid var(--bd);border-radius:8px;}}
+.tablewrap{{max-height:70vh;overflow:auto;border:1px solid var(--bd);border-radius:8px;scroll-padding-top:42px;}}
 table{{border-collapse:collapse;width:100%;background:#fff;font-size:13px;color:var(--text);}}
 th,td{{border:1px solid var(--grid);padding:6px 10px;text-align:left;white-space:nowrap;}}
 th{{position:sticky;top:0;background:#f5f7fa;z-index:2;font-weight:600;color:var(--text2);font-size:12px;}}
@@ -89,6 +142,13 @@ tr.row-abnormal td{{background:#fff8f8;}}
 tr.row-abnormal td:first-child{{box-shadow:inset 3px 0 0 var(--red);}}
 tr.row-normal td{{background:#fff;}}
 tr.row-wl td{{color:var(--muted);}}
+tr.row-main{{scroll-margin-top:48px;}}
+tr.row-main:target td{{background:#fff1f0;}}
+.problem-nav ul{{margin:4px 0 0;padding-left:18px;}}
+.problem-nav li{{margin:4px 0;}}
+.problem-nav a{{color:var(--blue);font-weight:600;text-decoration:none;}}
+.problem-nav a:hover{{text-decoration:underline;}}
+.problem-nav .more{{color:var(--muted);margin-top:6px;}}
 .bdg{{display:inline-block;padding:1px 8px;border-radius:4px;font-size:12px;font-weight:600;line-height:17px;vertical-align:1px;}}
 .bdg.pass{{color:var(--green);background:#e8ffea;border:1px solid #b8f2c2;}}
 .bdg.suspected{{color:var(--amber);background:#fffbeb;border:1px solid #fbbf24;}}
@@ -130,6 +190,8 @@ details.cd table.mini td,details.cd table.mini th{{padding:3px 8px;border:1px so
 <div class="stat"><div class="n" style="color:var(--green)">{pass_s:.1f}</div><div class="l">合格时长 (s)</div></div>
 <div class="stat"><div class="n" style="color:var(--red)">{fail_s:.1f}</div><div class="l">不合格时长 (s)</div></div>
 </div></div>
+
+{problem_section}
 
 <h2>📋 明细表</h2>
 <p>详情行号从 1 开始；含表头的 CSV 按物理行号减 1 显示，第一条时间戳记录为第 1 行。未知来源行号显示“-”。</p>
@@ -853,8 +915,40 @@ def _iter_render_detail(kind, payload):
         yield _render_detail(kind, payload)
 
 
+def _clip_text(text, limit=80) -> str:
+    text = " ".join(str(text or "").split())
+    return text if len(text) <= limit else text[:max(1, limit - 1)] + "…"
+
+
+def _render_problem_section(results: List[PartResult]) -> str:
+    """报告顶部的问题 Part 快速定位卡片（无问题时整段省略）。"""
+    problems = problem_parts(results)
+    if not problems:
+        return ""
+    limit = 20
+    items = []
+    for item in problems[:limit]:
+        reasons = "；".join(
+            f"{_esc(header)}：{_esc(_clip_text(text, 72))}"
+            for header, text in item["reasons"][:2])
+        if len(item["reasons"]) > 2:
+            reasons += f"；另有 {len(item['reasons']) - 2} 项"
+        suffix = f" — {reasons}" if reasons else ""
+        items.append(
+            f"<li><a href='#part-{item['index'] + 1}'>{_esc(item['name'])}</a>"
+            f"（{_esc(item['label'])}）{suffix}</li>")
+    more = (f"<div class='more'>… 其余 {len(problems) - limit} 个问题 Part "
+            "见下方明细表</div>" if len(problems) > limit else "")
+    return (
+        "<h2>🚨 问题 Part 快速定位</h2>"
+        "<div class='card problem-nav'>"
+        f"<p>本次共 {len(problems)} 个问题 Part（异常 / 执行异常 / 未验证），点击名称跳到对应明细行。</p>"
+        f"<ul>{''.join(items)}</ul>{more}</div>"
+    )
+
+
 def _iter_report_rows(results, cols):
-    for r in results:
+    for index, r in enumerate(results):
         cells = cols.row_cells(r)
         details = cols.row_details(r)
         cls = []
@@ -867,7 +961,7 @@ def _iter_report_rows(results, cols):
         else:
             cls.append("row-normal")
         clsstr = " class='row-main " + " ".join(cls) + "'"
-        yield f"<tr{clsstr}>"
+        yield f"<tr id='part-{index + 1}'{clsstr}>"
         for ci, cval in enumerate(cells):
             yield "<td>"
             yield _cell_html(cval)
@@ -1047,6 +1141,7 @@ def generate_html(results: List[PartResult], out_path: Path, root: Path,
                      '<div class="stat"><div class="n" style="color:var(--amber)">%d</div>'
                      '<div class="l">音频节拍疑似异常（诊断，不与业务结果相加）</div></div>'
                      % (stats["audio_unverified"], stats["audio_suspected"])),
+        problem_section=_render_problem_section(results),
         collect_s=stats["collect_s"], pass_s=stats["pass_s"], fail_s=stats["fail_s"],
         headers=headers, rows=_iter_report_rows(results, cols),
     )

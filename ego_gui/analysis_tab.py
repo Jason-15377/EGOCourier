@@ -56,6 +56,56 @@ def _field_label(text):
     return lbl
 
 
+def _clip_reason(text, limit=72):
+    text = " ".join(str(text or "").split())
+    return text if len(text) <= limit else text[:max(1, limit - 1)] + "…"
+
+
+def _problem_lines(problems, *, max_parts=10, max_reasons=2, indent=""):
+    """把 problem_parts() 结果排成完成弹窗里的可读文本。"""
+    lines = []
+    for item in problems[:max_parts]:
+        reasons = "；".join(
+            f"{header}：{_clip_reason(text)}"
+            for header, text in (item.get("reasons") or [])[:max_reasons])
+        if len(item.get("reasons") or []) > max_reasons:
+            reasons += f"；另有 {len(item['reasons']) - max_reasons} 项"
+        line = f"{indent}• {item.get('name') or 'Part'}（{item.get('label') or '异常'}）"
+        if reasons:
+            line += " — " + reasons
+        lines.append(line)
+    if len(problems) > max_parts:
+        lines.append(f"{indent}… 其余 {len(problems) - max_parts} 个问题 Part 见结果表 / HTML 报告")
+    return lines
+
+
+def _batch_problem_lines(runs, limit=10):
+    """批量分析按目录汇总问题 Part；返回 (行列表, 问题总数)。"""
+    lines = []
+    total = 0
+    shown = 0
+    for item in runs:
+        problems = item.get("problems") or []
+        if not problems:
+            continue
+        total += len(problems)
+        if shown >= limit:
+            continue
+        root = str(item.get("root") or "").strip()
+        name = os.path.basename(root.rstrip("\\/")) or root or "(未知目录)"
+        if len(runs) > 1:
+            lines.append(f"▸ {name}：")
+        for problem in problems:
+            if shown >= limit:
+                break
+            lines.extend(_problem_lines([problem], max_reasons=1,
+                                        indent="  " if len(runs) > 1 else ""))
+            shown += 1
+    if total > shown:
+        lines.append(f"… 其余 {total - shown} 个问题 Part 见各目录结果表 / HTML 报告")
+    return lines, total
+
+
 class AnalyzerWorker(QThread):
     """在后台线程执行一次完整分析：发现分段 → 逐段检查 → 跨段 → HTML。
 
@@ -570,11 +620,23 @@ class AnalysisTab(QWidget):
             "border-radius:4px;padding:4px 7px;}")
         self.ed_sched_date.setToolTip("仅一次模式的日期（默认跟随电脑当前日期）")
         self.ed_sched_date.setVisible(False)
-        self.btn_sched_sync_now = QPushButton("现在")
-        self.btn_sched_sync_now.setFixedWidth(56)
+        # 「此刻」是触发时间的内联快捷操作：扁平蓝字，不做成第二个描边按钮。
+        # 旧样式固定 56×30，被全局按钮内边距（9px/16px）挤压，文字发紧且
+        # 与两侧输入框抢视觉重量。
+        self.btn_sched_sync_now = QToolButton()
+        self.btn_sched_sync_now.setText("此刻")
+        self.btn_sched_sync_now.setCursor(Qt.PointingHandCursor)
+        self.btn_sched_sync_now.setAutoRaise(True)
         self.btn_sched_sync_now.setFixedHeight(30)
+        self.btn_sched_sync_now.setFocusPolicy(Qt.StrongFocus)
+        self.btn_sched_sync_now.setStyleSheet(
+            "QToolButton{border:none;background:transparent;color:#2563eb;"
+            "font-size:12px;padding:0 6px;}"
+            "QToolButton:hover{background:#eff6ff;border-radius:4px;color:#1d4ed8;}"
+            "QToolButton:focus{background:#eff6ff;border-radius:4px;}"
+            "QToolButton:pressed{background:#dbeafe;}")
         self.btn_sched_sync_now.setToolTip(
-            "同步为电脑当前时间（触发时刻取下一分钟，避免一保存就提示时间已过）")
+            "触发时间同步为电脑当前时间（取下一分钟，避免一保存就提示时间已过）")
         self.btn_sched_sync_now.clicked.connect(self._use_current_datetime)
         self.cmb_sched_repeat.currentIndexChanged.connect(self._sync_schedule_date)
         trig = QHBoxLayout()
@@ -1437,9 +1499,16 @@ class AnalysisTab(QWidget):
                 report = item["report"]
                 break
         error = next((item.get("error") for item in runs if item.get("error")), "")
+        # 调度器会把 runs 持久化到 analysis_schedule.json；问题清单只服务于
+        # 本次弹窗，持久化前剔除，避免报告明细撑大配置文件。
+        persisted_runs = [
+            {key: value for key, value in item.items() if key != "problems"}
+            for item in runs
+        ]
         self._scheduler.mark_finished(
             overall, occurrence=batch.get("occurrence"), duration_s=duration,
-            report=report, error=error, runs=runs if len(runs) > 1 else None)
+            report=report, error=error,
+            runs=persisted_runs if len(runs) > 1 else None)
         self._update_schedule_labels()
         ok = sum(1 for item in runs if item.get("status") == "finished")
         self._append_log(f"[定时] 批次结束：{ok}/{len(runs)} 个目录成功")
@@ -1447,7 +1516,7 @@ class AnalysisTab(QWidget):
         # 多个目录按顺序跑，只有整批结束才弹一次窗；单目录定时任务同样在这里收尾。
         self._notify_batch_done(batch, runs)
 
-    def _finish_schedule(self, status, report="", error=""):
+    def _finish_schedule(self, status, report="", error="", results=None):
         """分析结束统一回写调度状态；批次中则记录并启动下一个目录。"""
         ctx = self._run_ctx if isinstance(self._run_ctx, dict) else {}
         occurrence = ctx.get("scheduled_for")
@@ -1456,14 +1525,22 @@ class AnalysisTab(QWidget):
             duration = time.monotonic() - ctx["started"]
         batch = self._schedule_batch
         if batch:
-            batch["runs"].append({
+            entry = {
                 "root": ctx.get("root", ""),
                 "status": status,
                 "report": report or "",
                 "error": error or "",
                 "duration_s": round(duration, 1) if duration is not None else None,
                 "out_root": ctx.get("out", ""),
-            })
+            }
+            # 只保留精简的问题清单（Part 名/失败列），供批次结束弹窗直接列出
+            # 并定位异常 Part；不保留 PartResult 本身，避免多目录批次占用内存。
+            if results is not None:
+                try:
+                    entry["problems"] = rep.problem_parts(results)
+                except Exception:  # noqa: BLE001 —— 摘要失败不影响分析收尾
+                    entry["problems"] = []
+            batch["runs"].append(entry)
             if status == "partial" or self._closing:
                 self._finalize_schedule_batch()
             else:
@@ -1540,12 +1617,12 @@ class AnalysisTab(QWidget):
             return
         in_batch = self._schedule_batch is not None
         self._record_history("finished", results, out_root, html_path)
-        self._finish_schedule("finished", html_path)
+        self._finish_schedule("finished", html_path, results=results)
         if not in_batch:
             self._notify_analysis_done(results, out_root, html_path)
 
-    def _notify_analysis_done(self, results, out_root, html_path):
-        """单目录分析完成弹窗：可直接打开 HTML 报告或输出文件夹。"""
+    def _notify_analysis_done(self, results, out_root, html_path, *, stopped=False):
+        """单目录分析完成/停止弹窗：列出问题 Part，可直接定位或打开报告。"""
         if self._closing:
             return
         lines = []
@@ -1557,14 +1634,38 @@ class AnalysisTab(QWidget):
                 f"未验证 {stats['unverified']}")
             lines.append(
                 f"合格时长 {stats['pass_s']:.1f}s ｜ 不合格时长 {stats['fail_s']:.1f}s")
+        problems = rep.problem_parts(results) if results else []
+        if problems:
+            lines.append("")
+            lines.append(f"发现 {len(problems)} 个问题 Part（异常 / 执行异常 / 未验证）：")
+            lines.extend(_problem_lines(problems))
+            self._append_log(
+                "[问题 Part] "
+                + "；".join(f"{p['name']}（{p['label']}）" for p in problems[:10])
+                + (f"（共 {len(problems)} 个）" if len(problems) > 10 else ""))
+        elif results:
+            lines.append("")
+            lines.append("未发现异常 Part。")
+        if lines:
             lines.append("")
         lines.append(f"HTML 报告：{html_path or '（未生成）'}")
         if html_path:
             lines.append("")
             lines.append("是否打开 HTML 报告？")
+        if stopped:
+            title = "分析已停止"
+            headline = "分析已停止（已生成部分报告）"
+        elif problems:
+            title = "分析完成"
+            headline = f"分析完成，发现 {len(problems)} 个问题 Part"
+        else:
+            title = "分析完成"
+            headline = "分析完成，未发现异常 Part"
+        locate = self._locate_target(html_path, problems)
         self._show_finish_dialog(
-            "分析完成", "分析完成", "\n".join(lines), html_path,
-            out_root or (os.path.dirname(html_path) if html_path else ""))
+            title, headline, "\n".join(lines), html_path,
+            out_root or (os.path.dirname(html_path) if html_path else ""),
+            locate=locate, has_problems=bool(problems))
 
     def _notify_batch_done(self, batch, runs):
         """定时/批量分析只在全部目录结束后弹一次窗。"""
@@ -1605,6 +1706,11 @@ class AnalysisTab(QWidget):
         if len(lines) > 12:
             shown.append(f"… 其余 {len(lines) - 12} 个目录见运行日志")
         details = "\n".join(shown)
+        problem_lines, problem_total = _batch_problem_lines(runs)
+        if problem_total:
+            details += (f"\n\n发现 {problem_total} 个问题 Part（异常 / 执行异常 / 未验证）：\n"
+                        + "\n".join(problem_lines))
+            headline += f"，发现 {problem_total} 个问题 Part"
         if last_report:
             details += (f"\n\n最近一份 HTML 报告：\n{last_report}"
                         "\n\n是否打开 HTML 报告？")
@@ -1616,28 +1722,66 @@ class AnalysisTab(QWidget):
                     for item in runs if item.get("out_root")]
             out_base = outs[-1] if outs else (
                 os.path.dirname(last_report) if last_report else "")
+        # 优先定位到有报告的目录；若都没有报告，仍按住问题清单尝试定位当前表格。
+        problem_item = None
+        for item in runs:
+            problems = item.get("problems") or []
+            if not problems:
+                continue
+            problem_item = item
+            if item.get("report"):
+                break
+        locate = (self._locate_target(str(problem_item.get("report") or ""),
+                                      problem_item.get("problems") or [])
+                  if problem_item else None)
         self._show_finish_dialog(
             f"{prefix}完成" if ok == total else f"{prefix}结束",
-            headline, details, last_report, out_base)
+            headline, details, last_report, out_base,
+            locate=locate, has_problems=problem_total > 0)
 
-    def _show_finish_dialog(self, title, headline, details, report_path, out_dir):
-        """结束提示：打开 HTML 报告 / 打开输出文件夹 / 关闭。"""
+    def _locate_target(self, report_path, problems):
+        """构造「定位异常 Part」目标：当前结果表选中行 + 报告行锚点。"""
+        if not problems:
+            return None
+        first = problems[0]
+        table_row = None
+        if report_path and report_path == self._html_path and self._results:
+            for index, result in enumerate(self._results):
+                if getattr(result, "name", "") == first.get("name"):
+                    table_row = index
+                    break
+        if not report_path and table_row is None:
+            return None
+        return {
+            "report": report_path or "",
+            "part_index": first.get("index"),
+            "part_name": first.get("name") or "",
+            "table_row": table_row,
+        }
+
+    def _show_finish_dialog(self, title, headline, details, report_path, out_dir,
+                            locate=None, has_problems=False):
+        """结束提示：打开 HTML 报告 / 定位异常 Part / 打开输出文件夹 / 关闭。"""
         if self._closing:
             return
         box = QMessageBox(self)
-        box.setIcon(QMessageBox.Information)
+        box.setIcon(QMessageBox.Warning if has_problems else QMessageBox.Information)
         box.setWindowTitle(title)
         box.setText(headline)
         box.setInformativeText(details)
         box.setTextInteractionFlags(Qt.TextSelectableByMouse)
         report_btn = None
+        locate_btn = None
         dir_btn = None
         if report_path and os.path.isfile(report_path):
             report_btn = box.addButton("打开 HTML 报告", QMessageBox.AcceptRole)
+        if locate:
+            locate_btn = box.addButton("定位异常 Part", QMessageBox.ActionRole)
+            locate_btn.setToolTip("在结果表中选中，并在 HTML 报告中跳到第一个问题 Part")
         if out_dir and os.path.isdir(out_dir):
             dir_btn = box.addButton("打开输出文件夹", QMessageBox.ActionRole)
         close_btn = box.addButton("关闭", QMessageBox.RejectRole)
-        box.setDefaultButton(report_btn or close_btn)
+        box.setDefaultButton(report_btn or locate_btn or close_btn)
         # 定时分析可能在最小化时结束；闪一下任务栏，避免弹窗藏在后面没人看见。
         window = self.window()
         if window is not None and not window.isActiveWindow():
@@ -1646,8 +1790,44 @@ class AnalysisTab(QWidget):
         clicked = box.clickedButton()
         if clicked is report_btn:
             QDesktopServices.openUrl(QUrl.fromLocalFile(report_path))
+        elif clicked is locate_btn:
+            self._locate_problem_part(locate)
         elif clicked is dir_btn:
             QDesktopServices.openUrl(QUrl.fromLocalFile(out_dir))
+
+    def _locate_problem_part(self, target):
+        """选中结果表中的问题 Part，并打开 HTML 报告跳到对应的行锚点。"""
+        if not isinstance(target, dict):
+            return
+        report = str(target.get("report") or "")
+        part_index = target.get("part_index")
+        name = str(target.get("part_name") or "")
+        table_row = target.get("table_row")
+        selected = False
+        if isinstance(table_row, int) and 0 <= table_row < self.table.rowCount():
+            self.table.selectRow(table_row)
+            item = self.table.item(table_row, 0)
+            if item is not None:
+                self.table.scrollToItem(item, QAbstractItemView.PositionAtCenter)
+            self.table.setFocus()
+            selected = True
+        opened = False
+        if report and os.path.isfile(report) and isinstance(part_index, int) and part_index >= 0:
+            url = QUrl.fromLocalFile(report)
+            url.setFragment(f"part-{part_index + 1}")
+            QDesktopServices.openUrl(url)
+            opened = True
+        if not selected and not opened:
+            QMessageBox.information(
+                self, "定位异常 Part",
+                "未找到可定位的问题 Part，请在结果表或 HTML 报告中查看。")
+            return
+        bits = [name] if name else []
+        if selected:
+            bits.append("已在结果表选中")
+        if opened:
+            bits.append(f"已在 HTML 报告中定位第 {part_index + 1} 行")
+        self._append_log("[定位] " + "；".join(bits))
 
     def _on_failed(self, msg):
         message = str(msg or "").strip() or "错误：未知异常，请查看运行日志。"
@@ -1713,8 +1893,13 @@ class AnalysisTab(QWidget):
         self._reset_run_buttons()
         self._append_log("[分析已停止] 已生成部分报告")
         self.lbl_summary.setText("<b style='color:#b45309'>分析已停止，已生成部分报告</b>")
+        in_batch = self._schedule_batch is not None
         self._record_history("partial", [], self._out_root, self._html_path)
-        self._finish_schedule("partial", self._html_path)
+        self._finish_schedule("partial", self._html_path, results=self._results)
+        # 手动停止同样给出报告提示；批次由 _finalize_schedule_batch 统一弹窗。
+        if not in_batch and not self._closing:
+            self._notify_analysis_done(
+                self._results, self._out_root, self._html_path, stopped=True)
 
     # ------------------------------------------------------------------ 结果
     def _fill_table(self, results):

@@ -42,6 +42,7 @@ from PySide6.QtWidgets import (
 from .export_tab import BleScanWorker  # 复用：BLE 扫描后台线程
 from ego_relay import config as relay_config
 from ego_relay import evlog_pack  # 本地 EGOViewer 三类日志收集与打包
+from ego_relay import export_state  # 增量导出：app/SDK 上次导出起点
 
 
 # ---------------------------------------------------------------------------
@@ -196,13 +197,15 @@ class EvLogPackWorker(QThread):
 
     def __init__(self, root, out_dir, keys, stage_kwargs=None, auto_import=False,
                  auto_report=False, prefix="EGOViewer_logs",
-                 device_host="", sdk_port=None, sdk_root="", firmware_serials=None):
+                 device_host="", sdk_port=None, sdk_root="", firmware_serials=None,
+                 incremental_since=None):
         super().__init__()
         self.root, self.out_dir, self.keys = root, out_dir, keys
         self.stage_kwargs = dict(stage_kwargs or {})
         self.auto_import = auto_import
         self.auto_report = auto_report
         self.prefix = prefix
+        self.incremental_since = incremental_since
         self.device_host = device_host
         self.sdk_port = sdk_port
         self.sdk_root = sdk_root
@@ -258,6 +261,11 @@ class EvLogPackWorker(QThread):
                 **self.stage_kwargs)
             n = sum(len(v) for v in collected.values())
             if n == 0:
+                if self.incremental_since:
+                    raise RuntimeError(
+                        f"自 {export_state.format_stamp(self.incremental_since)} 以来"
+                        "没有新增的 app/SDK 日志。如需重新全量导出，请取消"
+                        "「只导新增日志」或点「清除记录」。")
                 raise RuntimeError("按当前筛选未找到任何日志，请调整筛选范围")
             self.status.emit(f"共收集 {n} 个日志文件，开始压缩…")
             zip_path = evlog_pack.pack_staged(
@@ -738,13 +746,14 @@ class EgoOneClickExportWorker(QThread):
     def __init__(self, root, out_dir, keys, stage_kwargs=None,
                  auto_import=False, auto_report=False,
                  device_host="", sdk_port=None, mobile_serials=None, sdk_root="",
-                 firmware_serials=None, zip_first=False):
+                 firmware_serials=None, zip_first=False, incremental_since=None):
         super().__init__()
         self.root, self.out_dir, self.keys = root, out_dir, keys
         self.stage_kwargs = dict(stage_kwargs or {})
         self.auto_import = auto_import
         self.auto_report = auto_report
         self.zip_first = bool(zip_first)
+        self.incremental_since = incremental_since
         # 手机日志与固件日志并列参与同一次导出；None/空表示不碰手机。
         self.mobile_serials = list(mobile_serials or [])
         # 用户在「固件设备」里手动勾选的序列号；空表示走自动策略（历史优先 → 延迟）。
@@ -954,6 +963,11 @@ class EgoOneClickExportWorker(QThread):
                     for ph in self.mobile_summary.get("phones", [])
                     for b in ph.get("bundles", [])))
             if n == 0 and not has_mobile:
+                if self.incremental_since:
+                    raise RuntimeError(
+                        f"自 {export_state.format_stamp(self.incremental_since)} 以来"
+                        "没有新增的 app/SDK 日志。如需重新全量导出，请取消"
+                        "「只导新增日志」或点「清除记录」。")
                 # 区分"没有日志"与"被时间段筛掉了"：后者多发生在默认时间段不含旧日志时，
                 # 提示用户放宽时间段，而不是误报为安装目录有问题。
                 s, e = self.stage_kwargs.get("start"), self.stage_kwargs.get("end")
@@ -1427,6 +1441,8 @@ class FirmwareDevicePicker(QDialog):
         v.addWidget(tip)
 
         self.listw = QListWidget()
+        # 走 QSS 里的应用内勾选/选中态，避免选项落到 Windows 原生深蓝实心块
+        self.listw.setObjectName("fwDeviceList")
         # 历史次数多的排前面，方便一眼看到常用设备
         ordered = sorted(
             self._devices,
@@ -1521,9 +1537,11 @@ class DeviceTab(QWidget):
         self._pack_worker: EvLogPackWorker | None = None  # 本地勾选打包
         self._mobile_scan: MobileScanWorker | None = None
         self._fw_scan: FirmwareDeviceScanWorker | None = None  # 固件设备列表枚举
+        self._fw_scan_auto = False    # 本次枚举是否由勾选手机日志自动拉起
         self._mobile_devices = []     # [{serial,model}]
         self._mobile_scan_ok = False  # 本页是否已成功扫到过手机（避免重复扫描）
         self._manual_selection: dict | None = None  # 手动勾选：{分类key: [绝对路径,...]}
+        self._incremental_ctx: dict | None = None   # 本次导出成功后要写回的增量起点
         self._devices = []            # [{name,address}]
         self._selected_address = ""
         self._settings = QSettings("EGO", "Relay")
@@ -1692,7 +1710,7 @@ class DeviceTab(QWidget):
         self.btn_fw_pick.setToolTip(
             "列出当前在线的设备（含导出历史次数），手动勾选要导出固件日志的那几台。\n"
             "不手动选时按「历史优先」自动挑：导出次数多 / 最近导出过的设备排前面。")
-        self.btn_fw_pick.clicked.connect(self._pick_firmware_devices)
+        self.btn_fw_pick.clicked.connect(lambda: self._pick_firmware_devices())
         self.btn_fw_auto = QPushButton("恢复自动")
         self.btn_fw_auto.setToolTip("清除手动勾选，回到自动模式（历史优先）")
         self.btn_fw_auto.setVisible(False)
@@ -1832,8 +1850,26 @@ class DeviceTab(QWidget):
         self.chk_zip.setToolTip(
             "勾选后「开始一键导出」会在导出目录旁额外生成同名 .zip；"
             "导出目录保留，仍可在「日志分析」页直接分析")
+        self.chk_incremental = QCheckBox("只导新增日志")
+        self.chk_incremental.setToolTip(
+            "仅对 app/SDK 本机日志生效：只导出上次成功导出之后新增的部分。\n"
+            "手机日志和设备固件日志仍全量拉取；首次导出会全量并记录起点。")
+        self.chk_incremental.toggled.connect(self._on_incremental_toggled)
+        self.btn_incr_reset = QToolButton()
+        self.btn_incr_reset.setText("清除记录")
+        self.btn_incr_reset.setCursor(Qt.PointingHandCursor)
+        self.btn_incr_reset.setAutoRaise(True)
+        self.btn_incr_reset.setStyleSheet(
+            "QToolButton{color:#2563eb;padding:2px 4px;}")
+        self.btn_incr_reset.setToolTip(
+            "清除当前 EGOViewer 根目录的增量记录，下次重新全量导出")
+        self.btn_incr_reset.clicked.connect(self._clear_incremental)
         pk_chk = QHBoxLayout()
         pk_chk.addWidget(self.chk_zip)
+        pk_chk.addSpacing(18)
+        pk_chk.addWidget(self.chk_incremental)
+        pk_chk.addSpacing(8)
+        pk_chk.addWidget(self.btn_incr_reset)
         pk_chk.addStretch(1)
         pk_chk_w = QWidget(); pk_chk_w.setLayout(pk_chk)
         v.addWidget(self._field_label("选项"), r, 0)
@@ -1985,6 +2021,9 @@ class DeviceTab(QWidget):
                 self.cmb_mobile.clear()
                 self.cmb_mobile.addItem("正在扫描手机…")
                 self._scan_mobile()
+            # 手机导出只带手机上当时连着的设备，指环/手表等从设备要靠 PC 端
+            # 固件日志补齐；勾选后直接拉起「固件设备」选择框，省去再点一次。
+            QTimer.singleShot(0, self._auto_open_fw_picker)
         else:
             self.cmb_mobile.setEnabled(True)
             self._set_mobile_idle()
@@ -2234,11 +2273,26 @@ class DeviceTab(QWidget):
         self._refresh_fw_mode_label()
         self.log("固件设备：恢复自动模式（历史优先）")
 
-    def _pick_firmware_devices(self):
-        """打开设备勾选对话框；确认后记录手动选择。"""
-        if self._fw_scan and self._fw_scan.isRunning():
-            self.log("设备列表正在扫描中，请稍候…")
+    def _auto_open_fw_picker(self):
+        """勾选手机日志后自动打开「固件设备」选择框。
+
+        自动拉起时枚举为空 / SDK 失败只写运行日志，不弹模态提示——这是顺手的
+        默认动作，不能反过来打断用户；用户主动点按钮时仍保留原来的弹窗提示。
+        """
+        if not self.chk_mobile.isChecked():
             return
+        self._pick_firmware_devices(auto=True)
+
+    def _pick_firmware_devices(self, auto=False):
+        """打开设备勾选对话框；确认后记录手动选择。
+
+        auto=True：勾选手机日志后自动拉起（见 _auto_open_fw_picker）。
+        """
+        if self._fw_scan and self._fw_scan.isRunning():
+            if not auto:
+                self.log("设备列表正在扫描中，请稍候…")
+            return
+        self._fw_scan_auto = bool(auto)
         self.btn_fw_pick.setEnabled(False)
         self.btn_fw_pick.setText("扫描中…")
         self.log("正在枚举设备（含导出历史）…")
@@ -2249,17 +2303,29 @@ class DeviceTab(QWidget):
         self._fw_scan.start()
 
     def _on_fw_scan_finished(self):
+        self._fw_scan_auto = False
         self.btn_fw_pick.setEnabled(True)
         self.btn_fw_pick.setText("选择设备…")
 
     def _on_fw_scan_fail(self, msg):
+        if getattr(self, "_fw_scan_auto", False):
+            self.log(f"固件设备：枚举失败（{msg}），保持自动模式")
+            return
         self.log(f"设备枚举失败：{msg}")
         QMessageBox.warning(self, "枚举失败", f"无法获取设备列表：\n{msg}")
 
     def _on_fw_scan(self, devices):
         from ego_relay import orbbec_sdk
+        auto = getattr(self, "_fw_scan_auto", False)
+        # 自动拉起后用户又把手机/固件日志取消了：这行已无意义，不必再弹框
+        if auto and not self._fw_row_needed():
+            self.log("固件设备：未勾选手机/固件日志，跳过自动选择")
+            return
         mem = orbbec_sdk.load_device_memory()
         if not devices:
+            if auto:
+                self.log("固件设备：当前没有枚举到在线设备，保持自动模式")
+                return
             QMessageBox.information(
                 self, "没有设备", "当前没有枚举到任何设备。\n"
                 "请确认设备已上电并与电脑在同一网络，或已用 USB 连上。")
@@ -2317,6 +2383,7 @@ class DeviceTab(QWidget):
             QMessageBox.warning(self, "提示", "请先选择有效的 EGOViewer 安装根目录")
             return
         filters = self._current_filters()
+        filters, inc_ctx = self._apply_incremental(filters, keys, log=True)
         if (self.cmb_filter.currentData() == "manual"
                 and needs_root and not (self._manual_selection or {})):
             QMessageBox.warning(self, "提示", "请先点击「选择日志文件…」勾选要导出的日志")
@@ -2338,6 +2405,7 @@ class DeviceTab(QWidget):
         if mobile_serials:
             desc += f"（手机 {len(mobile_serials)} 台）"
         self.log(f"开始一键导出：{root or '(仅手机)'} → {out_dir}（勾选 {desc}）")
+        self._incremental_ctx = inc_ctx
         self._export_worker = EgoOneClickExportWorker(
             root or "", out_dir, keys,
             stage_kwargs=filters,
@@ -2346,7 +2414,8 @@ class DeviceTab(QWidget):
             sdk_root=self._current_sdk_root(),
             mobile_serials=mobile_serials,
             firmware_serials=self._fw_serials,
-            zip_first=self.chk_zip.isChecked())
+            zip_first=self.chk_zip.isChecked(),
+            incremental_since=(inc_ctx or {}).get("since"))
         self._export_worker.progress.connect(self._progress_ui.set_value)
         self._export_worker.status.connect(self._append)
         self._export_worker.done.connect(self._on_export_done)
@@ -2401,6 +2470,7 @@ class DeviceTab(QWidget):
         self.log(f"一键导出完成：{export_dir}")
         if zip_path:
             self.log(f"日志压缩包：{zip_path}")
+        self._commit_incremental(export_dir)
         if getattr(self, "_after_export_analyze", False):
             self._after_export_analyze = False
             self._analyze_exported(export_dir)
@@ -2439,6 +2509,7 @@ class DeviceTab(QWidget):
             pass
 
     def _on_export_fail(self, err):
+        self._incremental_ctx = None
         self._append(f"[错误] 一键导出失败: {err}")
         self.log(f"一键导出失败: {err}")
         # 失败也是任务结束：进度条停在失败时的百分比会让人以为还在跑，
@@ -2478,6 +2549,7 @@ class DeviceTab(QWidget):
         self._progress_ui.reset()
 
     def _on_export_cancelled(self):
+        self._incremental_ctx = None
         self._reset_progress()
         self._append("一键导出已取消")
         self.log("一键导出已取消")
@@ -2616,6 +2688,101 @@ class DeviceTab(QWidget):
             return {"manual": self._manual_selection or {}}
         return {}
 
+    # ------------------------------------------------------ 增量导出（app/SDK）
+    def _incremental_keys(self):
+        """当前勾选且支持增量的本机日志分类。"""
+        keys = []
+        for key in export_state.LOCAL_KEYS:
+            chk = (getattr(self, "_pack_checks", None) or {}).get(key)
+            if chk is not None and chk.isChecked():
+                keys.append(key)
+        return keys
+
+    def _on_incremental_toggled(self, checked):
+        if checked and self.cmb_filter.currentData() == "manual":
+            self._append("[增量] 手动勾选模式下不适用，本次按手动选择导出")
+        self._update_pack_counts()
+
+    def _clear_incremental(self):
+        root = self._current_ev_root()
+        if not root:
+            return
+        try:
+            removed = export_state.clear_root(root)
+        except OSError as exc:
+            self._append(f"[增量] 清除记录失败：{exc}")
+            return
+        if removed:
+            self._append(f"[增量] 已清除 {root} 的增量记录，下次将全量导出")
+        else:
+            self._append("[增量] 当前目录没有增量记录")
+        self._update_pack_counts()
+
+    def _apply_incremental(self, filters, keys, *, log=False):
+        """把上次成功导出的起点并进 start；返回 (filters, ctx)。
+
+        ctx 只在真正适用增量时生成，导出成功后由 _commit_incremental 写回。
+        记录的是本次时间范围的结束时刻：导出期间新写入的日志不会被本次收集，
+        下次从结束时刻重扫，宁可重复，不丢日志。
+        """
+        if not getattr(self, "chk_incremental", None) or \
+                not self.chk_incremental.isChecked():
+            return filters, None
+        if "manual" in filters:
+            if log:
+                self._append("[增量] 手动勾选模式不适用增量，按手动选择导出")
+            return filters, None
+        local_keys = [k for k in keys if k in export_state.LOCAL_KEYS]
+        if not local_keys:
+            if log:
+                self._append("[增量] 本次未选 app/SDK 日志，增量不生效")
+            return filters, None
+        root = self._current_ev_root()
+        if not root or not os.path.isdir(root):
+            return filters, None
+        watermark = export_state.effective_watermark(root, local_keys)
+        user_start = filters.get("start")
+        user_end = filters.get("end")
+        stamp = float(user_end) if user_end is not None else time.time()
+        ctx = {"root": root, "keys": local_keys, "stamp": stamp,
+               "since": watermark}
+        if watermark is None:
+            if log:
+                self._append("[增量] 当前分类还没有导出记录，本次先全量导出并记录起点")
+            return filters, ctx
+        # 用户把开始时间调到增量起点之后：中间这段本次不导，不能推进记录。
+        if user_start is not None and float(user_start) > watermark + 1:
+            if log:
+                self._append(
+                    f"[增量] 开始时间晚于上次增量起点 "
+                    f"{export_state.format_stamp(watermark)}，保留原起点")
+            return filters, None
+        filters = dict(filters)
+        filters["start"] = watermark
+        if log:
+            self._append(
+                f"[增量] 只导出 {export_state.format_stamp(watermark)} 之后新增的 "
+                "app/SDK 日志")
+        return filters, ctx
+
+    def _commit_incremental(self, export_path):
+        """导出成功后推进增量起点；取消/失败不调用。"""
+        ctx = getattr(self, "_incremental_ctx", None)
+        self._incremental_ctx = None
+        if not ctx:
+            return
+        try:
+            export_state.set_watermarks(
+                ctx["root"], ctx["keys"], ctx["stamp"],
+                export_dir=export_path)
+        except OSError as exc:
+            self._append(f"[增量] 记录导出起点失败：{exc}")
+            return
+        self._append(
+            f"[增量] 已把 {export_state.format_stamp(ctx['stamp'])} 记为新的增量起点"
+            "（下次只导此后的新增日志）")
+        self._update_pack_counts()
+
     def _update_pack_counts(self):
         """刷新各分类勾选框旁的日志计数，使其与实际导出内容一致。
 
@@ -2627,11 +2794,15 @@ class DeviceTab(QWidget):
         """
         root = self._current_ev_root()
         filters = self._current_filters()
+        # 勾了「只导新增日志」时，计数也要按实际导出范围（含增量起点）显示，
+        # 否则界面写着 100 个、导出包里只有 3 个，现场会以为漏导。
+        local_filters, _inc_ctx = self._apply_incremental(
+            filters, self._incremental_keys())
         counts = {}
         if root and os.path.isdir(root):
             try:
                 # 仅统计 app/sdk（本机收集）；firmware 不参与本机计数
-                c = evlog_pack.collect(root, ["app", "sdk"], **filters)
+                c = evlog_pack.collect(root, ["app", "sdk"], **local_filters)
                 counts = {k: len(v) for k, v in c.items()}
             except Exception:  # noqa: BLE001
                 counts = {}
@@ -2780,6 +2951,7 @@ class DeviceTab(QWidget):
             QMessageBox.warning(self, "提示", "请至少勾选一种日志")
             return
         filters = self._current_filters()
+        filters, inc_ctx = self._apply_incremental(filters, keys, log=True)
         if self.cmb_filter.currentData() == "manual" and not (self._manual_selection or {}):
             QMessageBox.warning(self, "提示", "请先点击「选择日志文件…」勾选要打包的日志")
             return
@@ -2797,13 +2969,15 @@ class DeviceTab(QWidget):
         self.btn_export.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self.log(f"开始打包日志：{root} → {out_dir}（勾选 {'/'.join(keys)}）")
+        self._incremental_ctx = inc_ctx
         self._pack_worker = EvLogPackWorker(
             root, out_dir, keys,
             stage_kwargs=filters,
             device_host=self._device_ip,
             sdk_port=relay_config.ORBBEC_SDK_PORT,
             sdk_root=self._current_sdk_root(),
-            firmware_serials=self._fw_serials)
+            firmware_serials=self._fw_serials,
+            incremental_since=(inc_ctx or {}).get("since"))
         self._pack_worker.progress.connect(self._progress_ui.set_value)
         self._pack_worker.status.connect(self._append)
         self._pack_worker.done.connect(self._on_pack_done)
@@ -2815,6 +2989,7 @@ class DeviceTab(QWidget):
     def _on_pack_done(self, zip_path, sid, report_path):
         self._append(f"打包完成：{zip_path}")
         self.log(f"本地 EGOViewer 日志打包完成: {zip_path}")
+        self._commit_incremental(zip_path)
         ret = QMessageBox.question(
             self, "打包完成", f"已生成日志包：\n{zip_path}\n"
             "\n可在「日志分析」页对该包导出后的目录做完整性分析。"
@@ -2825,11 +3000,13 @@ class DeviceTab(QWidget):
             subprocess.Popen(["explorer", "/select,", zip_path])
 
     def _on_pack_fail(self, err):
+        self._incremental_ctx = None
         self._append(f"[错误] 打包失败: {err}")
         self.log(f"本地日志打包失败: {err}")
         self._reset_progress()
 
     def _on_pack_cancelled(self):
+        self._incremental_ctx = None
         self._reset_progress()
         self._append("打包已取消")
         self.log("本地日志打包已取消")
