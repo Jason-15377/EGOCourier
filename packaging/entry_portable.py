@@ -111,6 +111,12 @@ def _preflight() -> str:
 
 
 def main() -> int:
+    # 冻结后的分析子进程会带着 --multiprocessing-fork 重新执行本 exe；必须在
+    # 自检和 Qt 初始化之前分发，否则每个 worker 都会弹出一个独立主窗口。
+    import multiprocessing
+
+    multiprocessing.freeze_support()
+
     _install_roots()
     _install_excepthook()
 

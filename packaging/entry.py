@@ -22,7 +22,18 @@ else:
 if _root not in sys.path:
     sys.path.insert(0, _root)
 
-from ego_gui.main import main  # noqa: E402
+
+def _run() -> int:
+    # 冻结后的分析子进程会带着 --multiprocessing-fork 重新执行本 exe；这里
+    # 必须先分发，且不能先导入 Qt/ego_gui，否则子进程会再拉起一个主窗口。
+    import multiprocessing
+
+    multiprocessing.freeze_support()
+
+    from ego_gui.main import main as gui_main  # noqa: E402
+
+    return gui_main()
+
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(_run())

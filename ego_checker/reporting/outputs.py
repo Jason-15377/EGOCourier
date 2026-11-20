@@ -121,7 +121,7 @@ _HTML_TPL = """<!DOCTYPE html>
 }}
 *{{box-sizing:border-box;}}
 body{{font-family:"Segoe UI","Microsoft YaHei",sans-serif;margin:0;background:var(--bg);color:var(--text);font-size:13px;}}
-.wrap{{max-width:1280px;margin:0 auto;padding:24px 22px 60px;}}
+.wrap{{max-width:1600px;margin:0 auto;padding:24px 22px 60px;}}
 h1{{font-size:18px;margin:0;font-weight:700;color:#1d2129;letter-spacing:0.5px;}}
 .sub{{color:var(--muted);font-size:12px;font-weight:500;letter-spacing:0.2px;margin:6px 0 20px;}}
 h2{{font-size:15px;margin:24px 0 12px;font-weight:600;color:#1d2129;}}
@@ -135,8 +135,9 @@ h2{{font-size:15px;margin:24px 0 12px;font-weight:600;color:#1d2129;}}
 .stat .l{{color:var(--muted);font-size:12px;font-weight:500;letter-spacing:0.2px;margin-top:4px;}}
 .tablewrap{{max-height:70vh;overflow:auto;border:1px solid var(--bd);border-radius:8px;scroll-padding-top:42px;}}
 table{{border-collapse:collapse;width:100%;background:#fff;font-size:13px;color:var(--text);}}
-th,td{{border:1px solid var(--grid);padding:6px 10px;text-align:left;white-space:nowrap;}}
-th{{position:sticky;top:0;background:#f5f7fa;z-index:2;font-weight:600;color:var(--text2);font-size:12px;}}
+th,td{{border:1px solid var(--grid);padding:6px 10px;text-align:left;vertical-align:top;
+  white-space:normal;overflow-wrap:anywhere;word-break:break-word;}}
+.tablewrap > table > thead th{{position:sticky;top:0;background:#f5f7fa;z-index:2;font-weight:600;color:var(--text2);font-size:12px;}}
 tbody tr:hover{{background:var(--hover);}}
 tr.row-abnormal td{{background:#fff8f8;}}
 tr.row-abnormal td:first-child{{box-shadow:inset 3px 0 0 var(--red);}}
@@ -155,7 +156,7 @@ tr.row-main:target td{{background:#fff1f0;}}
 .bdg.fail{{color:var(--red);background:#ffece8;border:1px solid #ffcfc4;}}
 .overn{{color:var(--red);font-weight:600;}}
 .m{{color:var(--text2);}}
-details.cd{{margin-top:3px;font-size:11px;}}
+details.cd{{margin-top:3px;font-size:11px;contain:inline-size;max-width:100%;overflow-x:auto;}}
 details.cd summary{{cursor:pointer;color:var(--blue);font-weight:600;font-size:12px;}}
 details.cd table.mini{{width:100%;font-size:11px;margin-top:4px;}}
 details.cd table.mini td,details.cd table.mini th{{padding:3px 8px;border:1px solid var(--grid);}}
@@ -197,6 +198,7 @@ details.cd table.mini td,details.cd table.mini th{{padding:3px 8px;border:1px so
 <p>详情行号从 1 开始；含表头的 CSV 按物理行号减 1 显示，第一条时间戳记录为第 1 行。未知来源行号显示“-”。</p>
 <div class="tablewrap">
 <table>
+{colgroup}
 <thead><tr>{headers}</tr></thead>
 <tbody>
 {rows}
@@ -223,12 +225,22 @@ _STATUS = re.compile(r"\b(PASS|SUSPECTED|FAIL)\b")
 _OVERN = re.compile(r"超([0-9][0-9.]*%?)")
 
 
+# 明细表单元格里的绝对路径只保留文件名：一行错误信息往往重复多份长路径，
+# 完整路径放在 title 提示里，避免整行被撑成几千像素高。
+_WIN_PATH = re.compile(r"[A-Za-z]:\\(?:[^\\\r\n；,()\"'<>|]+[\\/])+")
+
+
 def _cell_html(text) -> str:
-    """把单元格文本渲染为 HTML: 状态转彩色徽章, 超阈计数标红."""
-    esc = html.escape(str(text))
+    """把单元格文本渲染为 HTML: 状态转彩色徽章, 超阈计数标红, 分行保留."""
+    raw = str(text)
+    shortened = _WIN_PATH.sub(lambda _match: "…\\", raw)
+    esc = html.escape(shortened)
     esc = _STATUS.sub(
         lambda m: f"<span class='bdg {m.group(1).lower()}'>{m.group(1)}</span>", esc)
     esc = _OVERN.sub(lambda m: f"<span class='overn'>超{m.group(1)}</span>", esc)
+    esc = esc.replace("\n", "<br>")
+    if shortened != raw:
+        return f"<div title='{html.escape(raw, quote=True)}'>{esc}</div>"
     return esc
 
 
@@ -237,6 +249,39 @@ def _more(n: int, limit: int, colspan: int) -> str:
         return ""
     return (f"<tr><td colspan={colspan} style='color:var(--muted);text-align:center'>"
             f"... 还有 {n - limit} 条</td></tr>")
+
+
+# 紧凑明细表各列的相对宽度。列宽按权重归一化，列数随设备/检查项增减时
+# 仍然能被浏览器分配在表格宽度内，不会把某一列压成一条细缝。
+_COMPACT_WIDTH_WEIGHTS = {
+    "数据文件夹名称": 11.5,
+    "Part数据名称": 4.5,
+    "相机 / 帧率 / 固件": 5.5,
+    "视频 / 音频时长": 10.0,
+    "视频时长": 10.0,
+    "相机帧数对齐": 7.5,
+    "鱼眼三目帧数对齐": 7.5,
+    "相机/鱼眼三目帧数对齐": 7.5,
+    "Depth/Depth RGB帧数对齐": 7.5,
+    "帧间隔波动(ms)": 7.5,
+    "相机基准同步对齐": 7.5,
+    "相机同步": 7.5,
+    "IMU与相机同步": 6.5,
+    "夹爪与相机同步": 6.5,
+    "丢帧": 6.5,
+    "音频完整性": 12.5,
+    "同步与对齐": 6.5,
+    "IMU频率核对": 6.5,
+    "业务结论": 7.0,
+}
+
+
+def _compact_colgroup(headers) -> str:
+    weights = [_COMPACT_WIDTH_WEIGHTS.get(header, 8.0) for header in headers]
+    total = sum(weights) or 1.0
+    return "".join(
+        f"<col style='width:{weight / total * 100:.2f}%'>"
+        for weight in weights)
 
 
 def _cam_sync_over_summary(sr) -> str:
@@ -921,7 +966,7 @@ def _clip_text(text, limit=80) -> str:
 
 
 def _render_problem_section(results: List[PartResult]) -> str:
-    """报告顶部的问题 Part 快速定位卡片（无问题时整段省略）。"""
+    """报告顶部的问题快速定位卡片（无问题时整段省略）。"""
     problems = problem_parts(results)
     if not problems:
         return ""
@@ -940,7 +985,7 @@ def _render_problem_section(results: List[PartResult]) -> str:
     more = (f"<div class='more'>… 其余 {len(problems) - limit} 个问题 Part "
             "见下方明细表</div>" if len(problems) > limit else "")
     return (
-        "<h2>🚨 问题 Part 快速定位</h2>"
+        "<h2>🚨 问题快速定位</h2>"
         "<div class='card problem-nav'>"
         f"<p>本次共 {len(problems)} 个问题 Part（异常 / 执行异常 / 未验证），点击名称跳到对应明细行。</p>"
         f"<ul>{''.join(items)}</ul>{more}</div>"
@@ -993,8 +1038,12 @@ def generate_html(results: List[PartResult], out_path: Path, root: Path,
                 r.firmware = firmware_map[r.name]
 
     stats = compute_stats(results)
-    cols = ReportColumns(results)
-    headers = "".join(f"<th>{_esc(h)}</th>" for h in cols.headers())
+    # HTML 报告用紧凑列：同一检查项的每相机结果在单元格内纵向排列，
+    # 避免几十列把明细表撑到需要左右横移。CSV/窗口结果表仍用完整列。
+    cols = ReportColumns(results, compact=True)
+    header_list = cols.headers()
+    headers = "".join(f"<th>{_esc(h)}</th>" for h in header_list)
+    colgroup = _compact_colgroup(header_list)
 
     cam_list = " / ".join(cols.cam_label.get(role, role) for role in cols.roles) or "-"
     p = params
@@ -1143,7 +1192,7 @@ def generate_html(results: List[PartResult], out_path: Path, root: Path,
                      % (stats["audio_unverified"], stats["audio_suspected"])),
         problem_section=_render_problem_section(results),
         collect_s=stats["collect_s"], pass_s=stats["pass_s"], fail_s=stats["fail_s"],
-        headers=headers, rows=_iter_report_rows(results, cols),
+        headers=headers, colgroup=colgroup, rows=_iter_report_rows(results, cols),
     )
     # Publish only after every section and UTF-8 write has completed. Each run
     # owns a unique temporary file in the destination directory (same filesystem).

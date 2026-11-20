@@ -149,6 +149,14 @@ def _ensure_data_root() -> None:
 
 
 def main() -> int:
+    # 打包成 exe 后，spawn 出来的分析子进程收到的是「重新执行本 exe +
+    # --multiprocessing-fork」；必须在任何界面初始化之前把控制权交给
+    # multiprocessing，否则每个子进程都会再开一个主窗口，父进程永远等不到
+    # 分析结果（并发分析卡死）。
+    import multiprocessing
+
+    multiprocessing.freeze_support()
+
     # 启动时确保 ffmpeg/ffprobe 在当前进程 PATH 中（新装 ffmpeg / 旧终端 PATH 也能识别）
     from ego_relay import deps
     deps.ensure_ffmpeg_on_path()

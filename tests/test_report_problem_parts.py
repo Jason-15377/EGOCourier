@@ -73,13 +73,13 @@ class ProblemPartsTest(unittest.TestCase):
             rep.generate_html(results, out, Path(tmp))
             html = out.read_text(encoding="utf-8")
 
-        self.assertIn("问题 Part 快速定位", html)
+        self.assertIn("问题快速定位", html)
         self.assertIn("href='#part-2'", html)
         self.assertIn("id='part-1'", html)
         self.assertIn("id='part-2'", html)
         self.assertIn("fail_part", html)
         # 正常 Part 不应出现在快速定位卡片里。
-        nav = html.split("问题 Part 快速定位", 1)[1].split("<h2>", 1)[0]
+        nav = html.split("问题快速定位", 1)[1].split("<h2>", 1)[0]
         self.assertNotIn("ok_part", nav)
 
 

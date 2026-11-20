@@ -137,7 +137,10 @@ def _imu_context_entries(payload):
 class ReportColumns:
     """动态构建明细表列: 每个测试项合并为一个单元格 (跨相机), 时间单位 ms 保留 3 位."""
 
-    def __init__(self, results: List[PartResult]):
+    def __init__(self, results: List[PartResult], *, compact: bool = False):
+        self.compact = bool(compact)
+        self._header_cache = None
+        self._compact_plan = None
         roles: List[str] = []
         for r in results:
             for role in r.cameras:
@@ -198,7 +201,7 @@ class ReportColumns:
         """µs -> ms, 保留 3 位小数."""
         return f"{us / 1000.0:.3f}"
 
-    def headers(self) -> List[str]:
+    def _build_headers(self) -> List[str]:
         h = ["数据文件夹名称", "Part数据名称", "相机", "帧率(fps)",
              "固件版本", "视频时长"]
         if self.audio_enabled:
@@ -231,6 +234,163 @@ class ReportColumns:
             h.append('IMU频率核对')
         h.append('业务结论')
         return h
+
+    def headers(self) -> List[str]:
+        full, plan = self._layout()
+        if not self.compact:
+            return full
+        return self._compact_headers(full, plan)
+
+    def _layout(self):
+        """Full column layout plus the compact merge plan, computed once."""
+        if self._header_cache is None:
+            self._header_cache = self._build_headers()
+            self._compact_plan = (self._build_compact_plan(self._header_cache)
+                                  if self.compact else [])
+        return self._header_cache, self._compact_plan
+
+    def _build_compact_plan(self, headers):
+        """HTML 报告：同一个检查项的「每相机一列」改为单元格内纵向分行."""
+        used = set()
+        groups = []
+        fixed = {header: index for index, header in enumerate(headers)}
+
+        def add(indices, header, labels):
+            if len(indices) < 2:
+                return
+            groups.append({
+                "indices": list(indices),
+                "header": header,
+                "labels": list(labels),
+            })
+            used.update(indices)
+
+        camera_labels = {"相机": "相机", "帧率(fps)": "帧率", "固件版本": "固件"}
+        camera_indices = [fixed[name] for name in camera_labels if name in fixed]
+        add(camera_indices, "相机 / 帧率 / 固件",
+            [camera_labels[headers[index]] for index in camera_indices])
+
+        media_labels = {"视频时长": "视频", "音频时长": "音频"}
+        media_indices = [fixed[name] for name in media_labels if name in fixed]
+        add(media_indices, "视频 / 音频时长",
+            [media_labels[headers[index]] for index in media_indices])
+
+        interval_suffix = "帧间隔波动(ms)"
+        interval_indices = [index for index, header in enumerate(headers)
+                            if index not in used and header.endswith(interval_suffix)]
+        add(interval_indices, interval_suffix,
+            [headers[index][:-len(interval_suffix)].strip()
+             for index in interval_indices])
+
+        sync_suffix = "基准同步对齐"
+        sync_indices = [index for index, header in enumerate(headers)
+                        if index not in used and header.endswith(sync_suffix)]
+        add(sync_indices, "相机基准同步对齐",
+            [headers[index][:-len(sync_suffix)].strip()
+             for index in sync_indices])
+
+        sync_groups = [CAM_SYNC_GROUPS[0][1], self.depth_rgb_sync_label,
+                       self.fisheye_sync_label]
+        sync_group_labels = ["Depth", "Depth RGB", "鱼眼"]
+        sync_group_indices = [fixed[name] for name in sync_groups
+                              if name in fixed and fixed[name] not in used]
+        add(sync_group_indices, "相机同步",
+            [sync_group_labels[sync_groups.index(headers[index])]
+             for index in sync_group_indices])
+
+        imu_indices = [index for index, header in enumerate(headers)
+                       if index not in used and header.startswith("IMU与")
+                       and header.endswith("同步")]
+        add(imu_indices, "IMU与相机同步",
+            [headers[index][len("IMU与"):-len("同步")]
+             for index in imu_indices])
+
+        grip_indices = [index for index, header in enumerate(headers)
+                        if index not in used and header.startswith("夹爪与")
+                        and header.endswith("同步")]
+        add(grip_indices, "夹爪与相机同步",
+            [headers[index][len("夹爪与"):-len("同步")]
+             for index in grip_indices])
+
+        drop_labels = {"相机丢帧": "相机", "IMU丢帧": "IMU", "夹爪丢帧": "夹爪"}
+        drop_indices = [fixed[name] for name in drop_labels if name in fixed]
+        add(drop_indices, "丢帧",
+            [drop_labels[headers[index]] for index in drop_indices])
+
+        audio_labels = {"音频包完整性": "包完整性", "音频丢帧结果": "丢帧结果"}
+        audio_indices = [fixed[name] for name in audio_labels if name in fixed]
+        add(audio_indices, "音频完整性",
+            [audio_labels[headers[index]] for index in audio_indices])
+
+        misc_labels = {"多组IMU差值(ms)": "IMU差值", "同行同步对齐(ms)": "同行对齐",
+                       "SEI对齐": "SEI"}
+        misc_indices = [fixed[name] for name in misc_labels if name in fixed]
+        add(misc_indices, "同步与对齐",
+            [misc_labels[headers[index]] for index in misc_indices])
+
+        groups.sort(key=lambda group: group["indices"][0])
+        return groups
+
+    @staticmethod
+    def _compact_headers(full, plan):
+        by_start = {group["indices"][0]: group for group in plan}
+        merged = {index for group in plan for index in group["indices"]}
+        out = []
+        for index, header in enumerate(full):
+            group = by_start.get(index)
+            if group is not None:
+                out.append(group["header"])
+            elif index not in merged:
+                out.append(header)
+        return out
+
+    def _compact_cells(self, cells):
+        _full, plan = self._layout()
+        by_start = {group["indices"][0]: group for group in plan}
+        merged = {index for group in plan for index in group["indices"]}
+        out = []
+        for index, value in enumerate(cells):
+            group = by_start.get(index)
+            if group is not None:
+                lines = []
+                for label, cell_index in zip(group["labels"], group["indices"]):
+                    text = str(cells[cell_index]) if cell_index < len(cells) else "-"
+                    lines.append(f"{label}: {text}" if label else text)
+                out.append("\n".join(lines) or "-")
+            elif index not in merged:
+                out.append(value)
+        return out
+
+    def _compact_details(self, details):
+        _full, plan = self._layout()
+        by_start = {group["indices"][0]: group for group in plan}
+        merged = {index for group in plan for index in group["indices"]}
+        out = []
+        for index, detail in enumerate(details):
+            group = by_start.get(index)
+            if group is not None:
+                out.append(self._merge_details(details, group["indices"]))
+            elif index not in merged:
+                out.append(detail)
+        return out
+
+    @staticmethod
+    def _merge_details(details, indices):
+        blocks = []
+        for index in indices:
+            detail = details[index] if index < len(details) else None
+            if not detail:
+                continue
+            if isinstance(detail, tuple):
+                blocks.append(detail)
+            elif isinstance(detail, list):
+                if detail and isinstance(detail[0], tuple):
+                    blocks.extend(detail)
+                else:
+                    blocks.append(detail)
+        if not blocks:
+            return None
+        return blocks[0] if len(blocks) == 1 else blocks
 
     def _sync_cell(self, sr) -> str:
         """同步类单元格: PASS/FAIL + max 偏差 + 超阈占比(若有)."""
@@ -305,6 +465,12 @@ class ReportColumns:
                 + (['imu_frequency'] if self.has_imu_frequency_audit else []) + [''])
 
     def row_cells(self, r: PartResult) -> List[str]:
+        cells = self._build_row_cells(r)
+        if not self.compact:
+            return cells
+        return self._compact_cells(cells)
+
+    def _build_row_cells(self, r: PartResult) -> List[str]:
         ra = r.row_align
         ms = self._ms
         audio_duration = audio_validation.device_summary(
@@ -537,6 +703,12 @@ class ReportColumns:
         return cells
 
     def row_details(self, r: PartResult) -> List:
+        det = self._build_row_details(r)
+        if not self.compact:
+            return det
+        return self._compact_details(det)
+
+    def _build_row_details(self, r: PartResult) -> List:
         """返回与 row_cells 对齐的每列详情描述符.
 
         描述符为 (kind, payload) 元组或 None:
